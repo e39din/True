@@ -18,6 +18,12 @@ Source: [`simple.py`](https://github.com/e39din/True/blob/main/Simple.py) · Tes
 
 ---
 
+## Demo :)
+
+[![Видео Title](https://img.youtube.com/vi/ss3uSePhVKE/maxresdefault.jpg)](https://www.youtube.com/watch?v=ss3uSePhVKE)
+
+---
+
 ## Quick start
 
 ```bash
@@ -33,4 +39,4 @@ Full documentation: [docs/README.md](docs/README.md).
 
 ## License
 
-MIT. Author — Александр Кундрюков (a.kundryukov@gmail.com)
+MIT. Author - Александр Кундрюков (a.kundryukov@gmail.com)
