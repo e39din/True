@@ -1,4 +1,4 @@
-# Simple — True language interpreter
+# Simple - True language interpreter
 
 **True** is a programming language where a program is a **tape of qubits** (strings),
 and an **agent**-observer "measures" qubits step by step, swapping them.
@@ -6,7 +6,7 @@ and an **agent**-observer "measures" qubits step by step, swapping them.
 **Simple** is a cross-platform interpreter in Python 3 + Tkinter.
 One file, no dependencies.
 
-> **Status**: MVP. True is a full-fledged language with its own concept —
+> **Status**: MVP. True is a full-fledged language with its own concept -
 > it can evolve as an independent language.
 
 | Language | Docs | Article |
