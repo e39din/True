@@ -14,7 +14,7 @@ One file, no dependencies.
 | **English** | [docs/README.md](docs/README.md) | [docs/article.md](docs/article.md) |
 | **Русский** | [docs/ru/README.md](docs/ru/README.md) | [docs/ru/article.md](docs/ru/article.md) |
 
-Source: [`simple.py`](simple.py) · Tests: `python3 simple.py --test` · License: MIT
+Source: [`simple.py`](https://github.com/e39din/True/blob/main/Simple.py) · Tests: `python3 simple.py --test` · License: MIT
 
 ---
 
