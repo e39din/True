@@ -9,6 +9,9 @@ One file, no dependencies.
 > **Status**: MVP. True is a full-fledged language with its own concept -
 > it can evolve as an independent language.
 
+*Ideologically, True is somewhat similar to Lisp in how it handles data, self-modification, and syntax brevity, while at the same time it differs in its cyclic nature, explicit agents, and type definition.*
+
+Read more:
 | Language | Docs | Article |
 |---|---|---|
 | **English** | [docs/README.md](docs/README.md) | [docs/article.md](docs/article.md) |
