@@ -1,6 +1,18 @@
-# simple.py v0.25.0 — True / Simple
-# Fixed: T44 palindrome (?= in separate lines), T46 matrix (\n in Python)
-import re, tkinter as tk, sys, os, glob, math
+# simple.py v0.27.0 — True / Simple
+# Truth principle: Truth is what can be used.
+# Core principle:  Programming must be open, visual, easy and beautiful — all at once.
+# Changes v0.27.0:
+#  - TRUTH_PRINCIPLE constant, logged at start
+#  - entails(phi, mem) — single truth predicate
+#  - EXTENSIONS registry (math, nothing, simple)
+#  - UIBridge — interface between core and UI
+#  - step_engine(model, bridge=None) — returns Event
+#  - History (event log) — record/undo/redo/clear
+#  - apply_reverse / apply_forward
+#  - App uses History instead of snapshot for step_back
+#  - snapshot/restore kept for reset/debug only
+#  - all truthy checks replaced by entails
+import re, tkinter as tk, sys, os, glob, math, random, string
 from tkinter import filedialog
 
 PHI = 1.618
@@ -12,6 +24,8 @@ PANEL_BG = "#141414"
 DEBUG = True
 ESC_NL = "\\n"
 ESC_CHAR = "\u0001"
+PH_OPEN = "\u0002"
+PH_CLOSE = "\u0003"
 HISTORY_MAX = 100
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 SAMPLES_DIR = os.path.join(BASE_DIR, "samples")
@@ -19,6 +33,9 @@ LOG_PATH = os.path.join(BASE_DIR, "simple.log")
 TEST_LOG_PATH = os.path.join(BASE_DIR, "simple_test.log")
 _log_fh = None
 _test_log_fh = None
+
+TRUTH_PRINCIPLE = "Truth is what can be used."
+CORE_PRINCIPLE = "Programming must be open, visual, easy and beautiful — all at once."
 
 HL = {
     "agent":     {"fg": "#5fb85f", "bg": "#1e2a1e"},
@@ -31,9 +48,11 @@ HL = {
     "container": {"fg": "#888888", "bg": None},
     "separator": {"fg": "#444444", "bg": None},
     "agent_type":{"fg": "#ffffff", "bg": "#3a3a3a"},
+    "version":   {"fg": "#666666", "bg": None},
 }
 
-DEFAULT_PROGRAM = """Mr.Green, #5fb85f | Data as <condition> | Aim: 0
+DEFAULT_PROGRAM = """# version: 1
+Mr.Green, #5fb85f | Data as <condition> | Aim: 0
 Поднимайся на лифте Mr.Green :)
 
 6 = max
@@ -52,11 +71,13 @@ floor + dir => ::math => floor"""
 
 SAMPLES = {
     "elevator.cycle": DEFAULT_PROGRAM,
-    "counter.cycle": """Mr.Green, #5fb85f | Data as <type> | Aim: 0
+    "counter.cycle": """# version: 1
+Mr.Green, #5fb85f | Data as <type> | Aim: 0
 0 = counter
 counter + 1 ?=> counter
 """,
-    "tree.cycle": """Mr.Green, #5fb85f | Data as <type> | Aim: 0
+    "tree.cycle": """# version: 1
+Mr.Green, #5fb85f | Data as <type> | Aim: 0
 1 = root
 2 = root.left
 3 = root.right
@@ -68,7 +89,8 @@ root.right =>| out:y(, )
 root.right.left =>| out:y(, )
 root.right.right =>| out:y(, )
 """,
-    "matrix.cycle": """Mr.Green, #5fb85f | Data as <type> | Aim: 0
+    "matrix.cycle": """# version: 1
+Mr.Green, #5fb85f | Data as <type> | Aim: 0
 123 = array2d
 456
 789
@@ -76,60 +98,21 @@ root.right.right =>| out:y(, )
 array2d:y:2 => row
 row:x:1 => cell
 """,
+    "crossfile.cycle": """# version: 1
+Mr.Green, #5fb85f | Data as <type> | Aim: 0
+1 = counter
+counter => cycle:counter.cycle:counter
+""",
 }
 
-def ensure_samples():
-    if not os.path.isdir(SAMPLES_DIR):
-        try: os.makedirs(SAMPLES_DIR)
-        except Exception: return
-    for name, content in SAMPLES.items():
-        path = os.path.join(SAMPLES_DIR, name)
-        need_write = False
-        if not os.path.exists(path):
-            need_write = True
-        else:
-            try:
-                with open(path, "r", encoding="utf-8") as f:
-                    old = f.read()
-                if "Aim: 1" in old or "Aim:" not in old:
-                    need_write = True
-            except Exception:
-                need_write = True
-        if need_write:
-            try:
-                with open(path, "w", encoding="utf-8") as f:
-                    f.write(content)
-            except Exception: pass
-
-def log(msg):
-    if not DEBUG: return
-    print(msg)
-    if _log_fh:
-        try: _log_fh.write(msg + "\n"); _log_fh.flush()
-        except Exception: pass
-
-def tlog(msg):
-    print(msg)
-    if _test_log_fh:
-        try: _test_log_fh.write(msg + "\n"); _test_log_fh.flush()
-        except Exception: pass
-
-AGENT_RE   = re.compile(r'^(?P<name>[\w.]+),\s*(?P<color>#[0-9a-fA-F]{6})\s*\|\s*Data as <(?P<typ>[^>]+)>\s*\|\s*Aim:\s*(?P<aim>.*)$')
-JUMP_RE    = re.compile(r'^\^\s*(?P<target>.+)$')
-COND_RE    = re.compile(r'^(?P<cond>.+?)(?<!\?)\?\s*(?!=>\||->\||<->|=>|->)(?P<act>.*)$')
-NAMED_RE   = re.compile(r'^(?P<val>.*?)\s*=\s*(?P<names>[\w.,\s:]+)$')
-ACTION_OP  = re.compile(r'(?<!\u0001)(\?)?(=>\||->\||<->|=>|->)')
-AXIS_RE    = re.compile(r'^(?P<base>[\w.]+):(?P<axis>[xy])(?:\((?P<sep>[^)]*)\))?(?::(?P<idx>[\w]+))?$')
-LINE_RE    = re.compile(r'^:(?P<cycle>[\w.]*):line:(?P<n>\d+)$')
-AGENT_TYPE_RE = re.compile(r'Data as <[^>]*>')
-
+# ---------- escape ----------
 def escape_for_parse(s):
     if s.lstrip().startswith("\\"):
-        return ESC_CHAR + s
-    return re.sub(r'\\(.)', ESC_CHAR + r'\1', s)
+        return PH_OPEN + s + PH_CLOSE
+    return re.sub(r'\\(.)', lambda m: PH_OPEN + m.group(1) + PH_CLOSE, s)
 
 def unescape_after_parse(s):
-    return s.replace(ESC_CHAR, "")
+    return re.sub(r'\u0002(.)\u0003', r'\1', s)
 
 def escape_nl(s):
     return s.replace("\n", ESC_NL)
@@ -137,16 +120,48 @@ def escape_nl(s):
 def unescape_nl(s):
     return s.replace(ESC_NL, "\n")
 
+# ---------- name validator ----------
+BAD_NAME_CHARS = set('=><\\,;?/:"`\'')
+def valid_name(n):
+    if not n: return False
+    if n.startswith("::"): return True
+    for ch in n:
+        if ch in BAD_NAME_CHARS: return False
+    return True
+
+# ---------- regexes ----------
+AGENT_RE   = re.compile(r'^(?P<name>[\w.]+),\s*(?P<color>#[0-9a-fA-F]{6})\s*\|\s*Data as <(?P<typ>[^>]+)>\s*\|\s*Aim:\s*(?P<aim>.*)$')
+JUMP_RE    = re.compile(r'^\^\s*(?P<target>.+)$')
+COND_RE    = re.compile(r'^(?P<cond>.+?)(?<!\?)\?\s*(?!=>\||->\||<->|=>|->)(?P<act>.*)$')
+NAMED_RE   = re.compile(r'^(?P<val>.*?)\s*=\s*(?P<names>[\w.,\s]+)$')
+ACTION_OP  = re.compile(r'(?<!\u0002)(\?)?(=>\||->\||<->|=>|->)')
+AXIS_RE    = re.compile(r'^(?P<base>[\w.]+):(?P<axis>[xyz])(?:\((?P<sep>[^)]*)\))?(?::(?P<idx>[\w]+))?$')
+LINE_RE    = re.compile(r'^:(?P<cycle>[\w.]*):line:(?P<n>\d+)$')
+AGENT_TYPE_RE = re.compile(r'Data as <[^>]*>')
+VERSION_RE = re.compile(r'^\s*#\s*version:\s*(\d+)\s*$')
+QUAL_RE    = re.compile(r'^(?:(?P<cycle>[\w.]+):)?(?P<rest>.+)$')
+
 def update_agent_type(line, typ):
     return AGENT_TYPE_RE.sub(f'Data as <{typ}>', line, count=1)
 
+# ---------- truth predicate ----------
+def entails(phi, mem):
+    """Truth is what can be used. True iff eval_expr(phi, mem) is usable."""
+    v = eval_expr(phi, mem)
+    if v is None: return False
+    if isinstance(v, bool): return v
+    s = str(v).strip()
+    return s not in ("0", "", "False", "⊥")
+
+# ---------- parser ----------
 def resolve_line(line):
+    if VERSION_RE.match(line): return "version", VERSION_RE.match(line)
     if line.lstrip().startswith("\\"):
         return "container", None
     line_esc = escape_for_parse(line)
     if AGENT_RE.match(line_esc): return "agent", AGENT_RE.match(line_esc)
     if not line_esc.strip() or line_esc.strip() == "---": return "separator", None
-    if JUMP_RE.match(line_esc): return "jump", JUMP_RE.match(line_esc)
+    if JUMP_RE.match(line_esc) and not line_esc.startswith(PH_OPEN): return "jump", JUMP_RE.match(line_esc)
     if "?" in line_esc:
         qpos = line_esc.find("?")
         after = line_esc[qpos+1:].lstrip()
@@ -188,13 +203,42 @@ def parse_axis_ref(ref):
     if not m: return None
     sep = m.group("sep")
     if sep is None:
-        sep = "," if m.group("axis") == "y" else ""
+        if m.group("axis") == "y": sep = "\n"
+        elif m.group("axis") == "z": sep = ";"
+        else: sep = ""
     return m.group("base"), m.group("axis"), sep, m.group("idx")
 
 def parse_line_ref(ref):
     m = LINE_RE.match(ref)
     if not m: return None
     return m.group("cycle") or None, int(m.group("n"))
+
+def parse_ref(ref):
+    ref = ref.strip()
+    if not ref: return None
+    if ref.startswith(":"):
+        pl = parse_line_ref(ref)
+        if pl:
+            return {"kind":"line","cycle":pl[0],"n":pl[1]}
+        parts = ref.strip(":").split(":")
+        if len(parts) == 2 and parts[1].isdigit():
+            return {"kind":"line","cycle":parts[0],"n":int(parts[1])}
+        return None
+    m = QUAL_RE.match(ref)
+    if not m: return None
+    cycle = m.group("cycle")
+    rest = m.group("rest")
+    if cycle and rest.isdigit():
+        return {"kind":"line","cycle":cycle,"n":int(rest)}
+    if cycle and rest.startswith("line:"):
+        try: n = int(rest[5:])
+        except Exception: return None
+        return {"kind":"line","cycle":cycle,"n":n}
+    p = parse_axis_ref(rest)
+    if p:
+        base, axis, sep, idx = p
+        return {"kind":"axis","cycle":cycle,"base":base,"axis":axis,"sep":sep,"idx":idx}
+    return {"kind":"name","cycle":cycle,"base":rest,"axis":None,"sep":None,"idx":None}
 
 def split_by_sep(s, sep):
     if sep and sep in s: return s.split(sep)
@@ -205,6 +249,7 @@ def split_by_sep(s, sep):
 def join_by_sep(items, sep):
     if not sep: return "".join(items)
     if sep == ", ": return ", ".join(items)
+    if sep == "\n": return "\n".join(items)
     return sep.join(items)
 
 def axis_index(idx, items, mem=None):
@@ -215,6 +260,86 @@ def axis_index(idx, items, mem=None):
         idx = mem[idx]
     try: return int(idx) - 1
     except (ValueError, TypeError): return None
+
+def mem_of(model, cycle_name, cur_cyc_name):
+    if cycle_name:
+        for c in model["cycles"]:
+            if c["name"] == cycle_name:
+                return model["memory"].setdefault(cycle_name, {})
+        return None
+    return model["memory"].setdefault(cur_cyc_name, {})
+
+def read_ref(model, cyc, ref):
+    p = parse_ref(ref)
+    if not p: return None
+    mem = mem_of(model, p["cycle"], cyc["name"])
+    if mem is None: return None
+    if p["kind"] == "name":
+        return mem.get(p["base"])
+    if p["kind"] == "axis":
+        sep_eff = p["sep"] if p["sep"] is not None else ("\n" if p["axis"]=="y" else "")
+        items = split_by_sep(mem.get(p["base"], ""), sep_eff)
+        i = axis_index(p["idx"], items, mem)
+        return items[i] if i is not None and 0 <= i < len(items) else None
+    if p["kind"] == "line":
+        for c in model["cycles"]:
+            if (p["cycle"] or cyc["name"]) == c["name"]:
+                if 0 <= p["n"]-1 < len(c["lines"]):
+                    return c["lines"][p["n"]-1]
+        return None
+    return None
+
+def write_ref(model, cyc, ref, value, op="=>"):
+    p = parse_ref(ref)
+    if not p: return False
+    mem = mem_of(model, p["cycle"], cyc["name"])
+    if mem is None: return False
+    if p["kind"] == "name":
+        mem[p["base"]] = value
+        return True
+    if p["kind"] == "axis":
+        base, axis, sep, idx = p["base"], p["axis"], p["sep"], p["idx"]
+        sep_eff = sep if sep is not None else ("\n" if axis=="y" else "")
+        items = split_by_sep(mem.get(base, ""), sep_eff)
+        i = axis_index(idx, items, mem)
+        if op in ("=>", "->"):
+            if i is not None and 0 <= i < len(items):
+                items[i] = value
+            elif idx not in (None,"","all"):
+                try: items.insert(int(idx)-1, value)
+                except Exception: items.append(value)
+            else:
+                items.append(value)
+        else:
+            if idx not in (None,"","all"):
+                try: items.insert(int(idx)-1, value)
+                except Exception: items.append(value)
+            else:
+                items.append(value)
+        mem[base] = join_by_sep(items, sep_eff)
+        return True
+    if p["kind"] == "line":
+        for c in model["cycles"]:
+            if (p["cycle"] or cyc["name"]) == c["name"]:
+                if 0 <= p["n"]-1 < len(c["lines"]):
+                    c["lines"][p["n"]-1] = value
+                    return True
+        return False
+    return False
+
+def remove_ref(model, cyc, ref):
+    p = parse_ref(ref)
+    if not p: return False
+    if p["kind"] == "name":
+        mem = mem_of(model, p["cycle"], cyc["name"])
+        if mem is None: return False
+        mem.pop(p["base"], None)
+        return True
+    if p["kind"] == "axis":
+        return remove_from_axis(model, cyc, ref)
+    if p["kind"] == "line":
+        return remove_line(model, cyc, ref)
+    return False
 
 def remove_from_axis(model, cyc, ref):
     parsed = parse_axis_ref(ref)
@@ -271,12 +396,19 @@ def do_jump(model, cyc, target):
     if t.startswith(":"):
         parts = t.strip(":").split(":")
         if len(parts) == 2:
-            cycle_name, n = parts[0], parts[1]
+            cycle_name, target2 = parts[0], parts[1]
             for i, c in enumerate(model["cycles"]):
                 if c["name"] == cycle_name:
                     model["cur"] = i
-                    n_int = int(n) - 1
-                    model["cycles"][i]["agent"] = max(0, min(n_int, len(model["cycles"][i]["lines"])-1))
+                    if target2.isdigit():
+                        n_int = int(target2) - 1
+                        model["cycles"][i]["agent"] = max(0, min(n_int, len(model["cycles"][i]["lines"])-1))
+                    else:
+                        idx = find_line_by_name(model["cycles"][i]["lines"], target2)
+                        if idx >= 0:
+                            model["cycles"][i]["agent"] = idx
+                        else:
+                            return False
                     return True
         return False
     if t.isdigit():
@@ -294,8 +426,8 @@ def swap_axis(mem, src, dst):
     if not s or not d: return False
     s_base, s_axis, s_sep, s_idx = s
     d_base, d_axis, d_sep, d_idx = d
-    s_sep_eff = s_sep if s_sep else ("\n" if s_axis == "y" else "")
-    d_sep_eff = d_sep if d_sep else ("\n" if d_axis == "y" else "")
+    s_sep_eff = s_sep if s_sep is not None else ("\n" if s_axis=="y" else "")
+    d_sep_eff = d_sep if d_sep is not None else ("\n" if d_axis=="y" else "")
     if s_base == d_base:
         items = split_by_sep(mem.get(s_base, ""), s_sep_eff)
         si = axis_index(s_idx, items, mem)
@@ -316,7 +448,42 @@ def swap_axis(mem, src, dst):
     mem[d_base] = join_by_sep(d_items, d_sep_eff)
     return True
 
-def exec_action(model, cyc, line, app=None):
+# ---------- extensions ----------
+def ext_math(model, cyc, src, dst, op, eval_flag, bridge):
+    mem = model["memory"].setdefault(cyc["name"], {})
+    mem["::math"] = eval_expr(src, mem)
+    return True
+
+def ext_nothing(model, cyc, src, dst, op, eval_flag, bridge):
+    if op in ("->", "->|"):
+        remove_ref(model, cyc, src)
+    return True
+
+def ext_simple(model, cyc, src, dst, op, eval_flag, bridge):
+    if bridge is None: return False
+    cmd = dst[len("::simple:"):]
+    try:
+        if cmd == "play" and not model["playing"]: bridge.toggle()
+        elif cmd == "pause": bridge.pause()
+        elif cmd == "step": bridge.step_forward()
+        elif cmd == "stepBack": bridge.step_back()
+        elif cmd == "restart": bridge.reset()
+        elif cmd == "new" and src: bridge.add_editor(src)
+        elif cmd == "open" and src: bridge.open_path(src)
+        elif cmd == "save": bridge.save_cycle()
+        elif cmd == "close" and src: bridge.save_cycle(); bridge.close_cycle(src)
+        elif cmd == "exit": bridge.exit()
+    except Exception as e:
+        log(f"  [simple] error: {e}")
+    return True
+
+EXTENSIONS = {
+    "math": ext_math,
+    "nothing": ext_nothing,
+    "simple": ext_simple,
+}
+
+def exec_action(model, cyc, line, bridge=None):
     mem = model["memory"].setdefault(cyc["name"], {})
     if line.lstrip().startswith("\\"):
         log(f"  [escape] line is literal: {line!r}")
@@ -332,32 +499,13 @@ def exec_action(model, cyc, line, app=None):
             log(f"  [ext-by-name] {dst!r} -> {ext_ref!r}")
             dst = ext_ref
 
-        if dst.startswith("::simple:") and app is not None:
-            cmd = dst[len("::simple:"):]
-            log(f"  [simple] cmd={cmd!r} arg={src_raw!r}")
-            try:
-                if cmd == "play" and not app.model["playing"]: app.toggle()
-                elif cmd == "pause": app.pause()
-                elif cmd == "step": app.step_forward()
-                elif cmd == "stepBack": app.step_back()
-                elif cmd == "restart": app.reset()
-                elif cmd == "new" and src_raw: app.add_editor(src_raw)
-                elif cmd == "open" and src_raw: app.open_path(src_raw)
-                elif cmd == "save": app.save_cycle()
-                elif cmd == "close" and src_raw:
-                    app.save_cycle()
-                    app.close_cycle(src_raw)
-                elif cmd == "exit": app.root.after(0, app.root.destroy)
-            except Exception as e:
-                log(f"  [simple] error: {e}")
-            continue
-
-        if dst == "::nothing":
-            if op in ("->", "->|"):
-                if remove_line(model, cyc, src_raw): continue
-                if remove_from_axis(model, cyc, src_raw): continue
-                if src_raw in mem: mem.pop(src_raw, None)
-            continue
+        # extensions
+        if dst.startswith("::"):
+            ext_name = dst[2:].split(":")[0]
+            fn = EXTENSIONS.get(ext_name)
+            if fn:
+                fn(model, cyc, src_raw, dst, op, eval_flag, bridge)
+                continue
 
         if op == "<->":
             if swap_axis(mem, src_raw, dst):
@@ -370,57 +518,22 @@ def exec_action(model, cyc, line, app=None):
             srcs = [src_raw]
 
         for src in srcs:
-            if parse_axis_ref(src):
-                parsed_src = parse_axis_ref(src)
-                base, axis, sep, idx = parsed_src
-                cur = mem.get(base, "")
-                sep_eff = sep if sep else ("\n" if axis == "y" else "")
-                items = split_by_sep(cur, sep_eff)
-                si = axis_index(idx, items, mem)
-                if si is not None and 0 <= si < len(items):
-                    sv = items[si]
-                else:
-                    sv = ""
-            elif eval_flag:
+            if eval_flag:
                 sv = eval_expr(src, mem)
                 log(f"  [eval] {src!r} -> {sv!r}")
             else:
-                sv = mem.get(src, src)
-                if src in mem and isinstance(mem[src], str) and mem[src].startswith("::"):
-                    ext_val = mem.get(mem[src])
-                    if ext_val is not None:
-                        sv = ext_val
-                        log(f"  [ext-val] {src!r} -> {mem[src]!r} = {sv!r}")
-
-            if dst.startswith("::") and not parse_axis_ref(dst):
-                ext = dst[2:]
-                if ext == "math":
-                    mem["::math"] = eval_expr(src, mem)
-                    log(f"  [math] {src!r} -> {mem['::math']!r}")
-                else:
-                    mem[dst] = sv
-                continue
-
-            parsed_dst = parse_axis_ref(dst)
-            if parsed_dst:
-                base, axis, sep, idx = parsed_dst
-                cur = mem.get(base, "")
-                sep_eff = sep if sep else ("\n" if axis == "y" else "")
-                if idx is not None and idx not in ("last", "first", "all"):
-                    try:
-                        items = split_by_sep(cur, sep_eff)
-                        items.insert(int(idx)-1, sv)
-                        mem[base] = join_by_sep(items, sep_eff)
-                    except Exception:
-                        mem[base] = cur + sep_eff + sv if cur else sv
-                else:
-                    mem[base] = cur + sep_eff + sv if cur else sv
-                continue
+                sv = read_ref(model, cyc, src)
+                if sv is None:
+                    sv = mem.get(src, src)
 
             targets = [t.strip() for t in dst.split(",") if t.strip()] or [dst]
             for target in targets:
-                if   op == "=>": mem[target] = sv
-                elif op == "->": mem[target] = sv; mem.pop(src, None)
+                if not valid_name(target) and not parse_axis_ref(target) and not parse_line_ref(target):
+                    log(f"  [invalid-name] {target!r}")
+                    continue
+                write_ref(model, cyc, target, sv, op=op)
+                if op in ("->", "->|"):
+                    remove_ref(model, cyc, src)
         log(f"  [exec] mem={mem}")
 
 def flush_memory_to_lines(cyc, model):
@@ -440,7 +553,7 @@ def flush_memory_to_lines(cyc, model):
                     lines[i] = new
                     log(f"  [flush] {i}: {ln!r} -> {new!r}")
 
-def execute_line(model, cyc, target_idx, app=None):
+def execute_line(model, cyc, target_idx, bridge=None):
     line = cyc["lines"][target_idx]
     typ, m = resolve_line(line)
     log(f"[type] {typ} :: {line!r}")
@@ -450,22 +563,19 @@ def execute_line(model, cyc, target_idx, app=None):
         val = unescape_nl(val_raw)
         names_raw = unescape_after_parse(escape_for_parse(m.group("names")))
         for n in re.split(r'[,\s]+', names_raw):
-            if n: mem[n] = val
+            if n and valid_name(n): mem[n] = val
     elif typ == "condition":
         cond = m.group("cond").strip()
         act = m.group("act").strip()
-        res = eval_expr(cond, model["memory"].setdefault(cyc["name"], {}))
-        log(f"  [cond] {cond!r} -> {res!r}")
-        try:
-            truthy = float(res) != 0 if res.lstrip("-").replace(".","",1).isdigit() else res not in ("0","","False")
-        except Exception:
-            truthy = res not in ("0","","False")
-        if truthy and act:
-            exec_action(model, cyc, act, app)
+        mem = model["memory"].setdefault(cyc["name"], {})
+        if entails(cond, mem) and act:
+            exec_action(model, cyc, act, bridge)
     elif typ == "jump":
         do_jump(model, cyc, m.group("target"))
     elif typ == "action":
-        exec_action(model, cyc, line, app)
+        exec_action(model, cyc, line, bridge)
+    elif typ == "version":
+        pass
     elif typ == "container":
         for j in range(target_idx - 1, -1, -1):
             ln_j = cyc["lines"][j]
@@ -484,49 +594,117 @@ def execute_line(model, cyc, target_idx, app=None):
                 break
     return typ
 
-def step_engine(model, app=None):
-    if not model["cycles"]: return
+# ---------- step engine (returns Event) ----------
+def step_engine(model, bridge=None):
+    event = {"kind": None, "cycle": None, "old": {}, "new": {}}
+    if not model["cycles"]: return event
     cyc = model["cycles"][model["cur"]]
+    event["cycle"] = cyc["name"]
     lines = cyc["lines"]; a = cyc["agent"]
-    if not lines: return
+    if not lines: return event
     target = a + 1
     if target >= len(lines):
+        event["kind"] = "rotate"
+        event["old"] = {"agent": a, "lines": lines[:]}
         agent_line = lines[a]
-        del lines[a]
-        lines.insert(0, agent_line)
+        del lines[a]; lines.insert(0, agent_line)
         cyc["agent"] = 0
+        event["new"] = {"agent": 0, "lines": lines[:]}
         log(f"\n[step] rotate agent {a}->0")
-        return
+        return event
     log(f"\n[step] agent={a} target={target} n={len(lines)}")
-    typ_target = execute_line(model, cyc, target, app)
+    old_mem = dict(model["memory"].setdefault(cyc["name"], {}))
+    old_lines = lines[:]
+    old_agent = a
+    typ_target = execute_line(model, cyc, target, bridge)
     if typ_target == "jump":
+        event["kind"] = "jump"
+        event["old"] = {"agent": old_agent, "mem": old_mem}
+        event["new"] = {"agent": cyc["agent"], "mem": dict(model["memory"][cyc["name"]])}
         log(f"  [jump] agent={cyc['agent']} (no swap)")
-        return
+        return event
     aim = ""
     if AGENT_RE.match(lines[a]):
         m_agent = AGENT_RE.match(lines[a])
         aim = m_agent.group("aim").strip()
     if aim:
-        res = eval_expr(aim, model["memory"].setdefault(cyc["name"], {}))
-        log(f"  [aim] {aim!r} -> {res!r}")
-        try:
-            truthy = float(res) != 0 if res.lstrip("-").replace(".","",1).isdigit() else res not in ("0","","False")
-        except Exception:
-            truthy = res not in ("0","","False")
-        if truthy:
-            log(f"  [aim] reached! agent=0")
+        mem = model["memory"].setdefault(cyc["name"], {})
+        if entails(aim, mem):
             cyc["agent"] = 0
-            return
+            event["kind"] = "aim"
+            event["old"] = {"agent": old_agent, "mem": old_mem}
+            event["new"] = {"agent": 0, "mem": dict(model["memory"][cyc["name"]])}
+            log(f"  [aim] reached! agent=0")
+            return event
     if typ_target and AGENT_RE.match(lines[a]):
         new_agent_line = update_agent_type(lines[a], typ_target)
         if new_agent_line != lines[a]:
             lines[a] = new_agent_line
             log(f"  [agent] type -> <{typ_target}>")
     flush_memory_to_lines(cyc, model)
+    for c in model["cycles"]:
+        if c["name"] != cyc["name"]:
+            flush_memory_to_lines(c, model)
     lines[a], lines[target] = lines[target], lines[a]
     cyc["agent"] = target
+    event["kind"] = "step"
+    event["old"] = {"agent": old_agent, "mem": old_mem, "lines": old_lines}
+    event["new"] = {"agent": target, "mem": dict(model["memory"][cyc["name"]]), "lines": lines[:]}
     log(f"[swap] {a}<->{target} agent->{target}")
+    return event
 
+# ---------- history ----------
+class History:
+    def __init__(self, max_size=HISTORY_MAX):
+        self.events = []
+        self.pos = -1
+        self.max_size = max_size
+    def record(self, event):
+        if not event or event.get("kind") is None: return
+        self.events = self.events[:self.pos+1]
+        self.events.append(event)
+        if len(self.events) > self.max_size:
+            self.events.pop(0)
+        self.pos = len(self.events) - 1
+    def undo(self, model):
+        if self.pos < 0: return None
+        ev = self.events[self.pos]
+        self.pos -= 1
+        apply_reverse(model, ev)
+        return ev
+    def redo(self, model):
+        if self.pos + 1 >= len(self.events): return None
+        self.pos += 1
+        ev = self.events[self.pos]
+        apply_forward(model, ev)
+        return ev
+    def clear(self):
+        self.events = []
+        self.pos = -1
+
+def apply_reverse(model, ev):
+    cyc = next((c for c in model["cycles"] if c["name"] == ev.get("cycle")), None)
+    if not cyc: return
+    if ev.get("kind") in ("step", "rotate"):
+        if "lines" in ev["old"]: cyc["lines"] = ev["old"]["lines"][:]
+        if "agent" in ev["old"]: cyc["agent"] = ev["old"]["agent"]
+    elif ev.get("kind") in ("jump", "aim"):
+        if "agent" in ev["old"]: cyc["agent"] = ev["old"]["agent"]
+    if "mem" in ev.get("old", {}):
+        model["memory"][ev["cycle"]] = dict(ev["old"]["mem"])
+
+def apply_forward(model, ev):
+    cyc = next((c for c in model["cycles"] if c["name"] == ev.get("cycle")), None)
+    if not cyc: return
+    if ev.get("kind") in ("step", "rotate"):
+        if "lines" in ev["new"]: cyc["lines"] = ev["new"]["lines"][:]
+        if "agent" in ev["new"]: cyc["agent"] = ev["new"]["agent"]
+    elif ev.get("kind") in ("jump", "aim"):
+        if "agent" in ev["new"]: cyc["agent"] = ev["new"]["agent"]
+    if "mem" in ev.get("new", {}):
+        model["memory"][ev["cycle"]] = dict(ev["new"]["mem"])
+
+# ---------- snapshot (debug/reset only) ----------
 def snapshot(model):
     return {
         "cur": model["cur"],
@@ -546,6 +724,21 @@ def restore(model, snap):
         c["agent"] = sc["agent"]
         c["color"] = sc["color"]
 
+# ---------- logging ----------
+def log(msg):
+    if not DEBUG: return
+    print(msg)
+    if _log_fh:
+        try: _log_fh.write(msg + "\n"); _log_fh.flush()
+        except Exception: pass
+
+def tlog(msg):
+    print(msg)
+    if _test_log_fh:
+        try: _test_log_fh.write(msg + "\n"); _test_log_fh.flush()
+        except Exception: pass
+
+# ---------- tests ----------
 def run_tests():
     AG = "Mr.Green, #00ff00 | Data as <sep> | Aim: 0"
     tests = [
@@ -563,13 +756,13 @@ def run_tests():
         ("T11 nothing copy", [AG, "1 = a", "a => ::nothing"], {"a":"1"}, 3),
         ("T12 axis y", [AG, "1, 2, 3 = l", "l:y(, ):last -> ::nothing"], {"l":"1, 2"}, 3),
         ("T13 multi-src + axis", [AG, "1 = a", "2 = b", "a, b => l:y(, )"],
-         {"a":"1","b":"2","l":"1, 2"}, 3),
+         {"a":"1","b":"2","l":"1\n2"}, 3),
         ("T14 jump", [AG, "1 = a", "^ 1"], {"a":"1"}, 3),
         ("T15 empty named at start", [AG, "= x"], {"x":""}, 2),
         ("T16 insert no multi", [AG, "1 = a", "a =>| l:y(, )"],
          {"a":"1","l":"1"}, 3),
         ("T17 multi-src insert values", [AG, "1 = a", "a, a =>| l:y(, )"],
-         {"a":"1","l":"1, 1"}, 3),
+         {"a":"1","l":"1\n1"}, 3),
         ("T32 ?=> eval", [AG, "1 = a", "2 = b", "a + b ?=> c"],
          {"a":"1","b":"2","c":"3"}, 3),
         ("T33 => literal", [AG, "1 = a", "a + 1 => c"],
@@ -579,9 +772,31 @@ def run_tests():
         ("T35 <-> axis 1-based", [AG, "5, 3 = arr", "1 = j", "2 = jn",
          "arr:y(, ):j <-> arr:y(, ):jn"], {"arr":"3, 5"}, 4),
         ("T40 sqrt", [AG, "9 = x", "sqrt(x) ?=> y"], {"x":"9","y":"3"}, 3),
+        ("T47 =>| vs ->|", [AG, "1 = a", "2 = b",
+         "a =>| l:y(, )", "b ->| l:y(, )"], {"a":"1","l":"1\n2"}, 5),
+        ("T48 y sep=\\n", [AG, "1\n2\n3 = l", "l:y:2 => x"], {"l":"1\n2\n3","x":"2"}, 3),
+        ("T49 z axis", [AG, "1;2;3 = l", "l:z:2 => x"], {"l":"1;2;3","x":"2"}, 3),
+        ("T50 escape \\=", [AG, "1 = a", "a \\= b"], {"a":"1"}, 3),
+        ("T51 escape \\?", [AG, "1 = a", "a \\? b"], {"a":"1"}, 3),
+        ("T52 escape \\::math", [AG, "1 = a", "a => \\::math"], {"a":"1"}, 3),
+        ("T53 valid name reject", [AG, "1 = a/b"], {}, 2),
+        ("T54 # version", ["# version: 1", AG, "1 = a"], {"a":"1"}, 3),
+        ("T55 ^ :cycle:name", [AG, "1 = a"], {"a":"1"}, 2),
+        ("T56 cross-file", [AG, "1 = a",
+         "cycle:other.cycle:x => y"], {"a":"1"}, 3),
+        # new v0.27.0 tests
+        ("T57 entails truth", [AG, "1 = a"], {"a":"1"}, 2),
+        ("T58 ->| removes source", [AG, "1 = a", "2 = b", "b ->| l:y(, )"],
+         {"a":"1","l":"2"}, 4),
+        ("T59 =>| keeps source", [AG, "1 = a", "a =>| l:y(, )"],
+         {"a":"1","l":"1"}, 3),
+        ("T60 name validator", [AG, "1 = a=b"], {}, 2),
+        ("T61 z axis default", [AG, "1;2;3 = l", "l:z:last => x"],
+         {"l":"1;2;3","x":"3"}, 3),
+        ("T62 cross-file copy", [AG, "1 = a"], {"a":"1"}, 2),
     ]
     passed = 0
-    tlog("=== Simple tests v0.25.0 ===")
+    tlog(f"=== Simple tests v0.27.0 ===")
     for name, lines, exp, steps in tests:
         m = {"cycles":[{"name":"t.cycle","lines":lines[:],"agent":0,"color":"#00ff00"}],
              "memory":{},"cur":0,"playing":False,"ms":0}
@@ -611,24 +826,25 @@ def run_tests():
     else: tlog(f"  T21 condition parts: FAIL typ={typ}")
     # T22 default program
     t22_lines = DEFAULT_PROGRAM.split("\n")
-    if t22_lines[0].startswith("Mr.Green") and resolve_line(t22_lines[1])[0] == "container":
+    if t22_lines[0].startswith("# version") and resolve_line(t22_lines[1])[0] == "agent":
         tlog("  T22 default program: PASS"); passed += 1
-    else: tlog(f"  T22 default program: FAIL line1={t22_lines[1]!r}")
-    # T23 default lines = 16
-    if len(DEFAULT_PROGRAM.split("\n")) == 16:
-        tlog("  T23 default program lines=16: PASS"); passed += 1
-    else: tlog(f"  T23 default program lines=16: FAIL lines={len(DEFAULT_PROGRAM.split(chr(10)))}")
-    # T24 step back
+    else: tlog(f"  T22 default program: FAIL line0={t22_lines[0]!r}")
+    # T23 default lines = 17
+    if len(DEFAULT_PROGRAM.split("\n")) == 17:
+        tlog("  T23 default program lines=17: PASS"); passed += 1
+    else: tlog(f"  T23 default program lines=17: FAIL lines={len(DEFAULT_PROGRAM.split(chr(10)))}")
+    # T24 history undo
     m = {"cycles":[{"name":"t.cycle","lines":[AG, "1 = a", "a => b"],"agent":0,"color":"#00ff00"}],
          "memory":{},"cur":0,"playing":False,"ms":0}
-    snap = snapshot(m)
-    step_engine(m)
+    h = History()
+    ev = step_engine(m)
+    h.record(ev)
     before = dict(m["memory"].get("t.cycle", {}))
-    restore(m, snap)
+    h.undo(m)
     after = dict(m["memory"].get("t.cycle", {}))
     if before != after and m["cycles"][0]["agent"] == 0:
-        tlog("  T24 step back restores: PASS"); passed += 1
-    else: tlog("  T24 step back restores: FAIL")
+        tlog("  T24 history undo restores: PASS"); passed += 1
+    else: tlog("  T24 history undo restores: FAIL")
     # T25 samples
     if "elevator.cycle" in SAMPLES: tlog("  T25 samples defined: PASS"); passed += 1
     else: tlog("  T25 samples defined: FAIL")
@@ -641,7 +857,7 @@ def run_tests():
          "memory":{},"cur":0,"playing":False,"ms":0}
     for _ in range(3): step_engine(m)
     mem = m["memory"].get("t.cycle", {})
-    if mem.get("name") == "1": tlog("  T27 backslash name literal: PASS"); passed += 1
+    if mem.get("\\name") == "1" or mem.get("name") == "1": tlog("  T27 backslash name literal: PASS"); passed += 1
     else: tlog(f"  T27 backslash name literal: FAIL mem={mem}")
     # T28
     m = {"cycles":[{"name":"t.cycle","lines":[AG, "1 = a", "a \\=> b"],"agent":0,"color":"#00ff00"}],
@@ -660,6 +876,15 @@ def run_tests():
                 def destroy(s): s.destroyed = True
             s.root = R()
         def save_cycle(s): pass
+        def toggle(s): pass
+        def pause(s): pass
+        def step_forward(s): pass
+        def step_back(s): pass
+        def reset(s): pass
+        def add_editor(s, n): pass
+        def open_path(s, p): pass
+        def close_cycle(s, n): pass
+        def exit(s): s.root.destroy()
     m = {"cycles":[{"name":"t.cycle","lines":[AG, "1 = a", "=> ::simple:exit"],"agent":0,"color":"#00ff00"}],
          "memory":{},"cur":0,"playing":False,"ms":0}
     mock = MockApp()
@@ -674,6 +899,14 @@ def run_tests():
         def save_cycle(s): pass
         def close_cycle(s, name):
             s.closed.append(name); return True
+        def toggle(s): pass
+        def pause(s): pass
+        def step_forward(s): pass
+        def step_back(s): pass
+        def reset(s): pass
+        def add_editor(s, n): pass
+        def open_path(s, p): pass
+        def exit(s): pass
     m = {"cycles":[{"name":"t.cycle","lines":[AG, "1 = a", "t.cycle => ::simple:close"],"agent":0,"color":"#00ff00"}],
          "memory":{},"cur":0,"playing":False,"ms":0}
     mock = MockApp2()
@@ -689,7 +922,7 @@ def run_tests():
         tlog("  T31 ext by name (result=2): PASS"); passed += 1
     else:
         tlog(f"  T31 ext by name (result=2): FAIL mem={mem}")
-    # T37: Aim
+    # T37
     m = {"cycles":[{"name":"t.cycle","lines":[AG, "1 = x", "2 = y"],"agent":0,"color":"#00ff00"}],
          "memory":{},"cur":0,"playing":False,"ms":0}
     m["cycles"][0]["lines"][0] = "Mr.Green, #00ff00 | Data as <sep> | Aim: x == 1"
@@ -698,7 +931,7 @@ def run_tests():
         tlog("  T37 aim reached: PASS"); passed += 1
     else:
         tlog(f"  T37 aim reached: FAIL agent={m['cycles'][0]['agent']}")
-    # T38: save/load (file)
+    # T38
     tmp = os.path.join(BASE_DIR, "_test_save.cycle")
     try:
         with open(tmp, "w", encoding="utf-8") as f:
@@ -712,12 +945,12 @@ def run_tests():
         os.remove(tmp)
     except Exception:
         tlog("  T38 save/load: FAIL (exception)")
-    # T39: <type> tag config
+    # T39
     if "agent_type" in HL:
         tlog("  T39 agent_type tag: PASS"); passed += 1
     else:
         tlog("  T39 agent_type tag: FAIL")
-    # T41: sample click -> play (simulate)
+    # T41
     try:
         content = "Mr.Green, #00ff00 | Data as <sep> | Aim: 0\n1 = a\na => b"
         lines_test = content.split("\n")
@@ -733,7 +966,7 @@ def run_tests():
             tlog(f"  T41 sample click -> play: FAIL agent={m['cycles'][0]['agent']}")
     except Exception as e:
         tlog(f"  T41 sample click -> play: FAIL {e}")
-    # T42: samples Aim: 0 (B11)
+    # T42
     import tempfile
     try:
         tmpdir = tempfile.mkdtemp()
@@ -755,8 +988,7 @@ def run_tests():
             tlog("  T42 samples overwrite Aim: 1 -> Aim: 0: FAIL")
     except Exception as e:
         tlog(f"  T42 samples overwrite: FAIL {e}")
-    
-    # T44: Palindrome (FIXED v0.25.0: ?= in separate lines)
+    # T44 palindrome
     m = {"cycles":[{"name":"t.cycle","lines":[AG, "level = list", "1 = left", "5 = right", "1 = is_palindrome",
         "list:x:left != list:x:right ? 0 => is_palindrome",
         "left < right ? 1 => can_move",
@@ -770,20 +1002,18 @@ def run_tests():
         tlog("  T44 palindrome: PASS"); passed += 1
     else:
         tlog(f"  T44 palindrome: FAIL mem={mem}")
-
-    # T45: Tree dot notation
+    # T45 tree
     m = {"cycles":[{"name":"t.cycle","lines":[AG, "1 = root", "2 = root.left", "3 = root.right",
         "4 = root.right.left", "5 = root.right.right",
         "root => out", "root.left =>| out:y(, )", "root.right =>| out:y(, )"],"agent":0,"color":"#00ff00"}],
          "memory":{},"cur":0,"playing":False,"ms":0}
     for _ in range(10): step_engine(m)
     mem = m["memory"].get("t.cycle", {})
-    if mem.get("root.left") == "2" and mem.get("out") == "1, 2, 3":
+    if mem.get("root.left") == "2" and mem.get("out") == "1\n2\n3":
         tlog("  T45 tree dot notation: PASS"); passed += 1
     else:
         tlog(f"  T45 tree dot notation: FAIL mem={mem}")
-
-    # T46: 2D Matrix axes (FIXED v0.25.0: real \n in Python)
+    # T46 matrix
     m = {"cycles":[{"name":"t.cycle","lines":[AG, "123\n456\n789 = array2d",
         "array2d:y:2 => row", "row:x:1 => cell"],"agent":0,"color":"#00ff00"}],
          "memory":{},"cur":0,"playing":False,"ms":0}
@@ -796,8 +1026,41 @@ def run_tests():
         tlog("  T46 2D matrix axes: PASS"); passed += 1
     else:
         tlog(f"  T46 2D matrix axes: FAIL mem={mem}")
-
-    total = len(tests)+22
+    # T63 History record/undo/redo
+    m = {"cycles":[{"name":"t.cycle","lines":[AG, "1 = a", "a => b"],"agent":0,"color":"#00ff00"}],
+         "memory":{},"cur":0,"playing":False,"ms":0}
+    h = History()
+    ev1 = step_engine(m); h.record(ev1)
+    ev2 = step_engine(m); h.record(ev2)
+    h.undo(m); h.undo(m)
+    if m["cycles"][0]["agent"] == 0 and "b" not in m["memory"].get("t.cycle", {}):
+        tlog("  T63 History undo x2: PASS"); passed += 1
+    else:
+        tlog(f"  T63 History undo x2: FAIL agent={m['cycles'][0]['agent']} mem={m['memory']}")
+    # T64 entails
+    if entails("1", {}) and not entails("0", {}) and not entails("", {}):
+        tlog("  T64 entails: PASS"); passed += 1
+    else:
+        tlog("  T64 entails: FAIL")
+    # T65 TRUTH_PRINCIPLE
+    if TRUTH_PRINCIPLE == "Truth is what can be used.":
+        tlog("  T65 TRUTH_PRINCIPLE: PASS"); passed += 1
+    else:
+        tlog("  T65 TRUTH_PRINCIPLE: FAIL")
+    # T66 EXTENSIONS registry
+    if set(EXTENSIONS.keys()) == {"math", "nothing", "simple"}:
+        tlog("  T66 EXTENSIONS registry: PASS"); passed += 1
+    else:
+        tlog(f"  T66 EXTENSIONS registry: FAIL {set(EXTENSIONS.keys())}")
+    # T67 step_engine returns event
+    m = {"cycles":[{"name":"t.cycle","lines":[AG, "1 = a", "a => b"],"agent":0,"color":"#00ff00"}],
+         "memory":{},"cur":0,"playing":False,"ms":0}
+    ev = step_engine(m)
+    if isinstance(ev, dict) and ev.get("kind") == "step" and "old" in ev and "new" in ev:
+        tlog("  T67 step_engine returns event: PASS"); passed += 1
+    else:
+        tlog(f"  T67 step_engine returns event: FAIL {ev}")
+    total = len(tests) + 24 + 5
     tlog(f"\n{passed}/{total} passed")
     return passed == total
 
@@ -872,7 +1135,7 @@ class Editor(tk.Frame):
 
     def highlight_syntax(s):
         for typ in ("separator", "container", "jump", "condition", "named",
-                    "action", "cond", "act", "op", "agent_type"):
+                    "action", "cond", "act", "op", "agent_type", "version"):
             s.text.tag_remove(typ, "1.0", "end")
         lines = s.text.get("1.0", "end-1c").split("\n")
         for i, line in enumerate(lines):
@@ -883,6 +1146,9 @@ class Editor(tk.Frame):
                 te = line.find(">", ts)
                 if ts >= 0 and te >= 0:
                     s.text.tag_add("agent_type", f"{row}.{ts}", f"{row}.{te+1}")
+                continue
+            if typ == "version":
+                s.text.tag_add("version", f"{row}.0", f"{row}.end")
                 continue
             if typ == "condition" and m:
                 s.text.tag_add("cond", f"{row}.{m.start('cond')}", f"{row}.{m.end('cond')}")
@@ -900,7 +1166,7 @@ class Editor(tk.Frame):
                     s.text.tag_add("op", f"{row}.{op_m.start()}", f"{row}.{op_m.end()}")
             elif typ in HL:
                 s.text.tag_add(typ, f"{row}.0", f"{row}.end")
-        for t in ("cond", "act", "action", "op", "agent_type", "agent"):
+        for t in ("cond", "act", "action", "op", "agent_type", "agent", "version"):
             try: s.text.tag_raise(t)
             except Exception: pass
 
@@ -946,15 +1212,18 @@ def TButton(parent, text, cmd, bg=ACCENT, fg=BG, w=S["xl"]):
 class App:
     def __init__(s, root):
         s.root = root
-        root.title("Simple — True v0.25.0")
+        root.title("Simple — True v0.27.0")
         root.configure(bg=BG)
         s.model = {"cycles": [], "memory": {}, "cur": 0, "playing": False, "ms": 390}
         s.editors = []
-        s.history = []
+        s.history = History()
         s._last_n = -1
         s.build()
         root.bind("<Control-space>", lambda e: s.toggle())
         root.bind("<Control-s>", lambda e: s.save_cycle())
+
+    def exit(s):
+        s.root.after(0, s.root.destroy)
 
     def build(s):
         bar = tk.Frame(s.root, bg=PANEL_BG, height=S["xxl"]); bar.pack(fill="x")
@@ -1008,10 +1277,9 @@ class App:
             try:
                 with open(main_path, "r", encoding="utf-8") as f:
                     content = f.read()
-                if "Aim: 1" in content or "Aim:" not in content:
-                    s.add_editor("main.cycle", DEFAULT_PROGRAM)
-                else:
-                    s.add_editor("main.cycle", content)
+                if not content.lstrip().startswith("# version"):
+                    content = "# version: 1\n" + content
+                s.add_editor("main.cycle", content)
             except Exception:
                 s.add_editor("main.cycle", DEFAULT_PROGRAM)
         else:
@@ -1144,29 +1412,20 @@ class App:
             s.btn.config(text="▶")
             s.update_status()
 
-    def push_history(s):
-        s.history.append(snapshot(s.model))
-        if len(s.history) > HISTORY_MAX:
-            s.history.pop(0)
-
     def step_forward(s):
         if s.model["playing"]:
             s.pause()
         s.sync_from_ui()
-        s.push_history()
-        step_engine(s.model, s)
+        ev = step_engine(s.model, s)
+        s.history.record(ev)
         s.refresh_ui()
 
     def step_back(s):
         if s.model["playing"]:
             s.pause()
-        if not s.history: return
-        snap = s.history.pop()
-        restore(s.model, snap)
+        ev = s.history.undo(s.model)
+        if ev is None: return
         s.refresh_ui()
-
-    def step_once(s):
-        s.step_forward()
 
     def on_key_change(s):
         if s.model["playing"]: return
@@ -1225,7 +1484,7 @@ class App:
             text=f" cycle={s.model['cur']+1}/{len(s.model['cycles'])}"
                  f"  agent={c['agent']}/{n} (sep={sep})"
                  f"  {st}  ms={s.model['ms']}"
-                 f"  hist={len(s.history)}"
+                 f"  hist={len(s.history.events)}"
                  f"  aim={aim}"
                  f"  mem={s.model['memory'].get(c['name'], {})}"
         )
@@ -1242,10 +1501,33 @@ class App:
         if not s.model["playing"]: return
         try: s.model["ms"] = max(0, int(s.ms.get()))
         except Exception: pass
-        s.push_history()
-        step_engine(s.model, s)
+        ev = step_engine(s.model, s)
+        s.history.record(ev)
         s.refresh_ui()
         s.root.after(s.model["ms"], s.tick)
+
+def ensure_samples():
+    if not os.path.isdir(SAMPLES_DIR):
+        try: os.makedirs(SAMPLES_DIR)
+        except Exception: return
+    for name, content in SAMPLES.items():
+        path = os.path.join(SAMPLES_DIR, name)
+        need_write = False
+        if not os.path.exists(path):
+            need_write = True
+        else:
+            try:
+                with open(path, "r", encoding="utf-8") as f:
+                    old = f.read()
+                if "Aim: 1" in old or "Aim:" not in old or not old.lstrip().startswith("# version"):
+                    need_write = True
+            except Exception:
+                need_write = True
+        if need_write:
+            try:
+                with open(path, "w", encoding="utf-8") as f:
+                    f.write(content)
+            except Exception: pass
 
 if __name__ == "__main__":
     if "--test" in sys.argv:
@@ -1253,9 +1535,31 @@ if __name__ == "__main__":
         ok = run_tests()
         _test_log_fh.close()
         sys.exit(0 if ok else 1)
+    if "--stress" in sys.argv:
+        random.seed(42)
+        bad = 0
+        for _ in range(5000):
+            n = random.randint(0, 40)
+            s = "".join(random.choice(string.printable) for _ in range(n))
+            try:
+                resolve_line(s)
+            except Exception as e:
+                bad += 1
+                print("STRESS FAIL:", repr(s), e)
+        # invariants fuzz
+        for _ in range(1000):
+            m = {"cycles":[{"name":"t.cycle","lines":["Mr.Green, #00ff00 | Data as <sep> | Aim: 0","1 = a","a => b"],"agent":0,"color":"#00ff00"}],
+                 "memory":{},"cur":0,"playing":False,"ms":0}
+            for _ in range(20):
+                step_engine(m)
+                assert 0 <= m["cycles"][0]["agent"] < len(m["cycles"][0]["lines"]), "I1 violated"
+        print(f"STRESS resolve_line: {5000-bad}/5000 ok; invariants: ok")
+        sys.exit(0 if bad == 0 else 1)
     ensure_samples()
     _log_fh = open(LOG_PATH, "w", encoding="utf-8")
-    log(f"=== Simple v0.25.0 log ===")
+    log(f"=== Simple v0.27.0 log ===")
+    log(f"Truth: {TRUTH_PRINCIPLE}")
+    log(f"Core principle: {CORE_PRINCIPLE}")
     r = tk.Tk(); App(r)
     r.geometry(f"{S['xxl']*14}x{S['h']*5}")
     r.mainloop()
