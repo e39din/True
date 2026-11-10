@@ -1,0 +1,14 @@
+=== Simple start ===
+[resolve_line] '' -> separator
+[resolve_line] '# version: 1' -> version
+[resolve_line] 'Mr.Green, #5fb85f | Data as <condition> | Aim: 0 | step: 0 | mode: 1' -> container
+[resolve_line] '6 = max' -> named
+[resolve_line] '1 = floor' -> named
+[resolve_line] '1 = dir' -> named
+[resolve_line] '= lift' -> named
+[resolve_line] 'dir > 0 ? floor =>| lift:y(, ):floor' -> condition
+[resolve_line] 'dir < 0 ? lift:y(, ):last  -> ::nothing' -> condition
+[resolve_line] 'floor == max ? -1 => dir' -> condition
+[resolve_line] 'floor == 1 ? 1 => dir' -> condition
+[resolve_line] 'floor + dir => ::math => floor' -> action
+[load_all_fns] []

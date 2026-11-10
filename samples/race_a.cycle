@@ -1,0 +1,6 @@
+# version: 1
+Mr.Red, #d04040 | Data as <type> | Aim: 0 | step: 0 | mode: 1
+
+:data.txt:line:1 => a
+a + "-" => a
+a => :data.txt:line:1

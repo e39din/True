@@ -1,0 +1,8 @@
+= args
+Pet
++ rov
+= surname
+
+= args
+my name is ${=> surname}
+= main

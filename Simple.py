@@ -1,20 +1,17 @@
 # simple.py — IDE, interpreter, presentation layer (threaded)
 # Version: true 0.9.9 / !true 0.9.6
-
-# ===== IMPORTS =====
-import os, glob, random, string, sys, threading, re
+import os, glob, random, string, sys, threading, re, subprocess
 import tkinter as tk
 from tkinter import filedialog
 
 from modules import (
     PHI, DEBUG, ESC_NL, ESC_CHAR, PH_OPEN, PH_CLOSE, HISTORY_MAX,
     TRUTH_PRINCIPLE, CORE_PRINCIPLE, TRUE_VERSION, NOT_TRUE_VERSION,
-    log, set_log_fh,
+    log, set_log_fh, set_log_level,
     valid_name, entails, eval_expr, parse_ref,
 )
 from creator import Creator, UIBridge, Agent
 
-# ===== CONSTANTS =====
 S = {"s":8, "m":13, "l":21, "xl":34, "xxl":55, "h":89}
 BG, FG, ACCENT = "#1a1a1a", "#e8e0d0", "#c8a04a"
 EDITOR_BG = "#202020"
@@ -27,6 +24,7 @@ TEST_LOG_PATH = os.path.join(BASE_DIR, "simple_test.log")
 
 HL = {
     "agent":     {"fg": "#5fb85f", "bg": "#1e2a1e"},
+    "agent_line":{"fg": "#5fb85f", "bg": None},
     "named":     {"fg": "#5b9bd5", "bg": None},
     "action":    {"fg": "#7fb069", "bg": None},
     "act":       {"fg": "#7fb069", "bg": None},
@@ -52,8 +50,8 @@ Mr.Green, #5fb85f | Data as <condition> | Aim: 0 | step: 0 | mode: 1
 dir > 0 ? floor =>| lift:y(, ):floor
 dir < 0 ? lift:y(, ):last  -> ::nothing
 
-floor == max ? -1 => dir
-floor == 1 ? 1 => dir
+floor >= max ? -1 => dir
+floor <= 1 ? 1 => dir
 
 floor + dir => ::math => floor"""
 
@@ -64,32 +62,78 @@ Mr.Green, #5fb85f | Data as <type> | Aim: 0 | step: 0 | mode: 1
 0 = counter
 counter + 1 ?=> counter
 """,
-    "matrix.cycle": """# version: 1
-Mr.Green, #5fb85f | Data as <type> | Aim: 0 | step: 0 | mode: 1
-123 = array2d
+    "matrix.tape": """# version: 1
+Mr.Green, #5fb85f | Data as <type> | Aim: 0 | step: 0 | mode: 0
+
+123
 456
 789
+= array2d
 
-array2d:y:2 => row
-row:x:1 => cell
+1 = i
+1 = j
+
+array2d:y:i:x:j % 2 == 0 ? X => array2d:y:i:x:j
+array2d:y:i:x:j % 2 == 1 ? O => array2d:y:i:x:j
+
+j + 1 ?=> j
+j > 3 ? 1 => j
+j == 1 ? i + 1 ?=> i
+i > 3 ? ::agent:finish
 """,
-    "classes.cycle": """# version: 1
-Mr.Green, #5fb85f | Data as <type> | Aim: 0 | step: 0 | mode: 1
+    "classes.tape": """# version: 1
+Mr.Green, #5fb85f | Data as <type> | Aim: 0 | step: 0 | mode: 0
 color: red; max_speed: 200; = args
 car, args => ::gen
 color; max_speed; = args
 car_1.cycle, args => ::check
+::agent:finish
 """,
     "script.tape": """# version: 1
 Mr.Green, #5fb85f | Data as <type> | Aim: 0 | step: 0 | mode: 0
 1 = a
 2 = b
+0 = result
 a + b => ::math => result
 ::agent:finish
 """,
+    "race_a.cycle": """# version: 1
+Mr.Red, #d04040 | Data as <type> | Aim: 0 | step: 0 | mode: 1
+
+:data.txt:line:1 => a
+a + "-" => a
+a => :data.txt:line:1
+""",
+    "race_b.cycle": """# version: 1
+Mr.Blue, #4080d0 | Data as <type> | Aim: 0 | step: 0 | mode: 1
+
+:data.txt:line:2 => b
+b + "-" => b
+b => :data.txt:line:2
+""",
+    "data.txt": """A: 
+B: 
+""",
+    "double.fn": """= args
+args * 2
+= double
+""",
+    "concat.fn": """= args
+Pet
++ rov
+= surname
+
+= args
+my name is ${=> surname}
+= main
+""",
+    "counter.fn": """= args
+1
++ 1
+= inc
+""",
 }
 
-# ===== EDITOR =====
 class Editor(tk.Frame):
     def __init__(s, parent, name, index, app):
         super().__init__(parent, bg=BG)
@@ -102,6 +146,10 @@ class Editor(tk.Frame):
         s.indicator.pack(side="left", padx=(0, S["s"]))
         tk.Label(head, text=f"#{index+1}  ·  {name}", bg=BG, fg=FG,
                  font=("TkDefaultFont", S["m"])).pack(side="left")
+        close_btn = tk.Label(head, text="×", bg=BG, fg="#888888",
+                             font=("TkDefaultFont", S["m"]), cursor="hand2")
+        close_btn.pack(side="right", padx=S["s"])
+        close_btn.bind("<Button-1>", lambda e: s.app.close_editor(s.name))
         body = tk.Frame(s, bg=EDITOR_BG); body.pack(fill="both", expand=True)
         s.gutter = tk.Canvas(body, width=S["xl"], bg=EDITOR_BG,
                              highlightthickness=0, bd=0)
@@ -150,18 +198,23 @@ class Editor(tk.Frame):
             else:
                 tags = s.app.creator.highlight_tags(line)
                 if i == 0 and "," in line and "#" in line and "Data as" in line:
-                    tags.append(("agent_type", 0, len(line)))
+                    mcol = re.search(r'#([0-9a-fA-F]{6})', line)
+                    if mcol:
+                        s.text.tag_config("agent_line", foreground="#" + mcol.group(1))
+                    tags.append(("agent_line", 0, len(line)))
                 s._hl_cache[line] = tags
             row = i + 1
             for tag, start, end in tags:
                 s.text.tag_add(tag, f"{row}.{start}", f"{row}.{end}")
-        for t in ("cond", "act", "action", "op", "agent_type", "agent", "version", "executing", "axis_hit"):
+        for t in ("cond", "act", "action", "op", "agent_line", "agent_type", "agent", "version", "executing", "axis_hit"):
             try: s.text.tag_raise(t)
             except Exception: pass
 
-    def set_agent(s, idx, executing=None):
+    def set_agent(s, idx, executing=None, agent_color=None):
         s.text.tag_remove("agent", "1.0", "end")
         s.text.tag_remove("executing", "1.0", "end")
+        if agent_color:
+            s.text.tag_config("agent", foreground=agent_color)
         lines = s.text.get("1.0", "end-1c").split("\n")
         if 0 <= idx < len(lines):
             s.text.tag_add("agent", f"{idx+1}.0", f"{idx+1}.end")
@@ -204,35 +257,17 @@ class Editor(tk.Frame):
     def set_text(s, t):
         s.text.delete("1.0", "end"); s.text.insert("1.0", t)
         s.text.see("1.0")
+        s._hl_cache = {}
         s.fit_height()
         s.redraw_gutter()
         s.highlight_syntax()
 
-# ===== AGENT BAR =====
-class AgentBar(tk.Frame):
-    def __init__(s, parent, app):
-        super().__init__(parent, bg=PANEL_BG, height=S["xxl"])
-        s.app = app
-        s.pack_propagate(False)
-        s.label = tk.Label(s, text="● agent: -", bg=PANEL_BG, fg="#444444",
-                           font=("Monospace", S["m"]), anchor="w", padx=S["s"])
-        s.label.pack(fill="x")
-    def update(s, agent_line, step, running=False, color="#5fb85f",
-               agent_name="", agent_type="", agent_aim=""):
-        dot_color = color if running else "#444444"
-        s.label.config(
-            text=f"● {agent_name}  |  step: {step}  |  type: {agent_type}  |  aim: {agent_aim}",
-            fg=dot_color
-        )
-
-# ===== BUTTON =====
 def TButton(parent, text, cmd, bg=ACCENT, fg=BG, w=S["xl"]):
     return tk.Button(parent, text=text, command=cmd, bg=bg, fg=fg,
                      font=("TkDefaultFont", S["m"]), width=w//S["m"],
                      relief="flat", bd=0, highlightthickness=0,
                      activebackground=bg, activeforeground=fg, cursor="hand2")
 
-# ===== APP =====
 class App:
     def __init__(s, root):
         s.root = root
@@ -249,10 +284,7 @@ class App:
     def exit(s):
         s.root.after(0, s.root.destroy)
 
-    # ===== BUILD =====
     def build(s):
-        s.agent_bar = AgentBar(s.root, s)
-        s.agent_bar.pack(fill="x", side="top")
         bar = tk.Frame(s.root, bg=PANEL_BG, height=S["xxl"]); bar.pack(fill="x")
         bar.pack_propagate(False)
         s.btn = TButton(bar, "▶", s.toggle); s.btn.pack(side="left", padx=S["s"], pady=S["s"])
@@ -265,7 +297,8 @@ class App:
         TButton(bar, "+", lambda: s.add_editor(f"cycle{len(s.editors)+1}.cycle"), bg=FG).pack(side="left", padx=S["s"])
         TButton(bar, "📂", s.open_file_dialog, bg=FG).pack(side="left", padx=S["s"])
         TButton(bar, "💾", s.save_cycle, bg=FG).pack(side="left", padx=S["s"])
-        TButton(bar, "⏮", s.reset, bg=FG).pack(side="left")
+        TButton(bar, "⏮", s.reset, bg=FG).pack(side="left", padx=S["s"])
+        TButton(bar, "terminal", s.open_terminal, bg=FG).pack(side="left", padx=S["s"])
 
         main = tk.Frame(s.root, bg=BG); main.pack(fill="both", expand=True)
         left = tk.Frame(main, bg=BG); left.pack(side="left", fill="both", expand=True)
@@ -281,6 +314,17 @@ class App:
         right.pack_propagate(False)
         tk.Label(right, text="samples", bg=PANEL_BG, fg=FG,
                  font=("TkDefaultFont", S["m"])).pack(anchor="w", padx=S["s"], pady=S["s"])
+        s.sample_filter = tk.StringVar(value="true")
+        filt_frame = tk.Frame(right, bg=PANEL_BG)
+        filt_frame.pack(fill="x", padx=S["s"], pady=(0, S["s"]))
+        for label, val in (("true", "true"), ("!true", "!true")):
+            b = tk.Radiobutton(filt_frame, text=label, variable=s.sample_filter,
+                               value=val, command=s.refresh_samples,
+                               bg=PANEL_BG, fg=FG, selectcolor=EDITOR_BG,
+                               activebackground=PANEL_BG, activeforeground=ACCENT,
+                               font=("TkDefaultFont", S["m"]), indicatoron=False,
+                               relief="flat", bd=0, padx=S["s"])
+            b.pack(side="left", fill="x", expand=True)
         s.samples_list = tk.Listbox(right, bg=EDITOR_BG, fg=FG,
                                     selectbackground=ACCENT, selectforeground=BG,
                                     font=("Monospace", S["m"]),
@@ -305,10 +349,27 @@ class App:
             s.add_editor("main.cycle", DEFAULT_PROGRAM)
         s.refresh_samples()
 
+    def open_terminal(s):
+        """Открывает системный терминал по умолчанию (Linux/macOS/Windows)."""
+        try:
+            if sys.platform == "win32":
+                subprocess.Popen("start cmd", shell=True)
+            elif sys.platform == "darwin":
+                subprocess.Popen(["open", "-a", "Terminal"])
+            else:
+                for cmd in (["x-terminal-emulator"], ["gnome-terminal"], ["konsole"], ["xterm"]):
+                    try:
+                        subprocess.Popen(cmd)
+                        return
+                    except FileNotFoundError:
+                        continue
+                log("terminal: no emulator found", "WARN")
+        except Exception as e:
+            log(f"terminal: {e}", "ERROR")
+
     def _on_canvas_resize(s, e):
         s.canvas.itemconfig(s._inner_win, width=e.width)
 
-    # ===== REFRESH =====
     def refresh_ui(s):
         for i, (c, ed) in enumerate(zip(s.model["cycles"], s.editors)):
             new = "\n".join(c["lines"])
@@ -319,10 +380,10 @@ class App:
                 ed.redraw_gutter()
                 ed.highlight_syntax()
             executing = c.get("agent_pos", 0) + 1 if c.get("agent_pos", 0) + 1 < len(c["lines"]) else None
-            ed.set_agent(c.get("agent_pos", 0), executing=executing)
             agent = s.creator.agents.get(c["name"])
             running = agent.running if agent else False
             agent_color = agent.color if agent else "#5fb85f"
+            ed.set_agent(c.get("agent_pos", 0), executing=executing, agent_color=agent_color)
             ed.set_running(running, agent_color)
             last_ref = s.model.get("last_axis_ref")
             if last_ref:
@@ -340,20 +401,6 @@ class App:
                             if base in names:
                                 ed.set_axis_hit(j)
                                 break
-        if s.model["cycles"]:
-            c = s.model["cycles"][s.model["cur"]]
-            agent = s.creator.agents.get(c["name"])
-            running = agent.running if agent else False
-            agent_color = agent.color if agent else "#5fb85f"
-            agent_name = agent.name if agent else "(no agent)"
-            agent_type = agent.typ if agent else ""
-            agent_aim = agent.aim if agent else ""
-            s.agent_bar.update(
-                c["lines"][c.get("agent_pos", 0)] if agent else "",
-                s.model.get("step_count", 0),
-                running=running, color=agent_color,
-                agent_name=agent_name, agent_type=agent_type, agent_aim=agent_aim
-            )
         s.update_status()
 
     def update_status(s):
@@ -371,7 +418,6 @@ class App:
                  f"  mem={s.model['memory'].get(c['name'], {})}"
         )
 
-    # ===== HANDLERS =====
     def toggle(s):
         s.model["playing"] = not s.model["playing"]
         s.btn.config(text="⏸" if s.model["playing"] else "▶")
@@ -393,6 +439,18 @@ class App:
         if s.model["playing"]: s.pause()
         s.sync_from_ui()
         s.creator.step_forward()
+        for c in s.model["cycles"]:
+            agent = s.creator.agents.get(c["name"])
+            if agent and c["lines"]:
+                agent.step = s.model.get("step_count", 0)
+                pos = c.get("agent_pos", 0)
+                if 0 <= pos < len(c["lines"]):
+                    agent.focus = c["lines"][pos]
+                    typ, _ = s.creator.resolve_line(agent.focus)
+                    agent.line_type = typ
+                    agent.typ = typ
+                if agent.parse(c["lines"][0]) is not False:
+                    c["lines"][0] = agent.to_line()
         s.refresh_ui()
 
     def step_back(s):
@@ -410,6 +468,7 @@ class App:
             for c, ed in zip(s.model["cycles"], s.editors):
                 t = ed.get_text().rstrip("\n")
                 c["lines"] = t.split("\n") if t else [""]
+                c["loop"] = c["name"].endswith(".cycle")
                 ed.fit_height()
                 if c["lines"]:
                     agent = Agent()
@@ -420,7 +479,20 @@ class App:
                         s.creator.agents.pop(c["name"], None)
                         c["has_agent"] = False
 
-    # ===== EDITORS MANAGEMENT =====
+    def close_editor(s, name):
+        for i, (c, ed) in enumerate(zip(s.model["cycles"], s.editors)):
+            if c["name"] == name:
+                s.creator.stop_all_threads()
+                s.model["cycles"].pop(i)
+                s.creator.agents.pop(name, None)
+                s.creator.threads.pop(name, None)
+                ed.destroy()
+                s.editors.pop(i)
+                if s.model["cur"] >= len(s.model["cycles"]):
+                    s.model["cur"] = max(0, len(s.model["cycles"]) - 1)
+                s.refresh_ui()
+                return
+
     def add_editor(s, name, initial_text=None):
         idx = len(s.editors)
         if idx > 0:
@@ -463,12 +535,19 @@ class App:
         except Exception: return
         s.add_editor(os.path.basename(path), content)
 
-    # ===== SAMPLES =====
     def refresh_samples(s):
         s.samples_list.delete(0, "end")
         s.samples_files = []
         if not os.path.isdir(SAMPLES_DIR): return
-        for path in sorted(glob.glob(os.path.join(SAMPLES_DIR, "*.cycle")) + glob.glob(os.path.join(SAMPLES_DIR, "*.tape"))):
+        filt = s.sample_filter.get() if hasattr(s, "sample_filter") else "true"
+        if filt == "true":
+            patterns = ["*.cycle", "*.tape"]
+        else:
+            patterns = ["*.fn"]
+        files = []
+        for pat in patterns:
+            files.extend(glob.glob(os.path.join(SAMPLES_DIR, pat)))
+        for path in sorted(files):
             name = os.path.basename(path)
             s.samples_list.insert("end", name)
             s.samples_files.append(path)
@@ -479,22 +558,17 @@ class App:
         idx = sel[0]
         if idx >= len(s.samples_files): return
         path = s.samples_files[idx]
+        name = os.path.basename(path)
         try:
             with open(path, "r", encoding="utf-8") as f:
                 content = f.read()
         except Exception:
             return
-        if s.editors:
-            s.model["playing"] = False
-            s.btn.config(text="▶")
-            s.editors[0].set_text(content)
-            s.sync_from_ui()
-            s.creator.runner.history.clear()
-            cur = s.model["cycles"][s.model["cur"]]
-            cur["agent_pos"] = 0
-            s.model["memory"].clear()
-            s.model["step_count"] = 0
-            s.refresh_ui()
+        s.model["playing"] = False
+        s.btn.config(text="▶")
+        s.creator.stop_all_threads()
+        s.add_editor(name, content)
+        s.refresh_ui()
 
     def save_cycle(s):
         if not s.model["cycles"]: return
@@ -502,14 +576,10 @@ class App:
         s.creator.save_cycle(cur["name"])
 
     def open_file_dialog(s):
-        path = filedialog.askopenfilename(
-            title="Open .cycle / .tape",
-            filetypes=[("Cycle/Tape files", "*.cycle *.tape"), ("All files", "*.*")]
-        )
+        path = filedialog.askopenfilename(title="Open file")
         if path:
             s.open_path(path)
 
-    # ===== RESET =====
     def reset(s):
         s.model["playing"] = False
         s.btn.config(text="▶")
@@ -529,11 +599,15 @@ class App:
         s.creator.reset()
         s.refresh_ui()
 
-# ===== ENSURE SAMPLES =====
 def ensure_samples():
     if not os.path.isdir(SAMPLES_DIR):
         try: os.makedirs(SAMPLES_DIR)
         except Exception: return
+    for old_name in ("classes.cycle", "matrix.cycle"):
+        p = os.path.join(SAMPLES_DIR, old_name)
+        if os.path.exists(p):
+            try: os.remove(p)
+            except Exception: pass
     for name, content in SAMPLES.items():
         path = os.path.join(SAMPLES_DIR, name)
         need_write = False
@@ -543,7 +617,10 @@ def ensure_samples():
             try:
                 with open(path, "r", encoding="utf-8") as f:
                     old = f.read()
-                if "Aim: 1" in old or "Aim:" not in old or not old.lstrip().startswith("# version"):
+                if ("Aim: 1" in old or "Aim:" not in old
+                    or not old.lstrip().startswith("# version")
+                    or "8 = floor" in old
+                    or (name == "script.tape" and "0 = result" not in old)):
                     need_write = True
             except Exception:
                 need_write = True
@@ -553,11 +630,20 @@ def ensure_samples():
                     f.write(content)
             except Exception: pass
 
-# ===== MAIN =====
 if __name__ == "__main__":
+    LOG = "--log" in sys.argv
+    QUIET = "--quiet" in sys.argv
     if "--test" in sys.argv:
+        set_log_fh(open(TEST_LOG_PATH, "w", encoding="utf-8"))
+        set_log_level("INFO" if QUIET else "DEBUG")
         import tests as _tests
-        ok = _tests.run_tests()
+        try:
+            ok = _tests.run_tests()
+        except Exception as e:
+            print(f"TESTS CRASH: {e}")
+            log(f"TESTS CRASH: {e}", "ERROR")
+            ok = False
+        set_log_fh(None)
         sys.exit(0 if ok else 1)
     if "--stress" in sys.argv:
         random.seed(42)
@@ -574,11 +660,10 @@ if __name__ == "__main__":
         print(f"STRESS resolve_line: {5000-bad}/5000 ok")
         sys.exit(0 if bad == 0 else 1)
     ensure_samples()
-    set_log_fh(open(LOG_PATH, "w", encoding="utf-8"))
-    log(f"=== Simple log ===")
-    log(f"true: {TRUE_VERSION} / !true: {NOT_TRUE_VERSION}")
-    log(f"Truth: {TRUTH_PRINCIPLE}")
-    log(f"Core principle: {CORE_PRINCIPLE}")
+    if LOG:
+        set_log_fh(open(LOG_PATH, "w", encoding="utf-8"))
+        set_log_level("DEBUG")
+    log("=== Simple start ===")
     r = tk.Tk(); App(r)
     r.geometry(f"{S['xxl']*14}x{S['h']*5}")
     r.mainloop()

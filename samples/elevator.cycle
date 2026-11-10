@@ -1,0 +1,15 @@
+# version: 1
+Mr.Green, #5fb85f | Data as <condition> | Aim: 0 | step: 0 | mode: 1
+6 = max
+1 = floor
+1 = dir
+
+= lift
+
+dir > 0 ? floor =>| lift:y(, ):floor
+dir < 0 ? lift:y(, ):last  -> ::nothing
+
+floor == max ? -1 => dir
+floor == 1 ? 1 => dir
+
+floor + dir => ::math => floor

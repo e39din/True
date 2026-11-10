@@ -1,9 +1,7 @@
 # modules.py — shared utilities for true and !true
 # Version: true 0.9.9 / !true 0.9.6
-# Axes: only x (chars) and y (lines), no z
 import re, math
 
-# ===== CONSTANTS =====
 PHI = 1.618
 DEBUG = True
 ESC_NL = "\\n"
@@ -16,21 +14,28 @@ CORE_PRINCIPLE = "Programming must be open, visual, easy and beautiful — all a
 TRUE_VERSION = "0.9.9"
 NOT_TRUE_VERSION = "0.9.6"
 
+LOG_LEVELS = {"DEBUG": 10, "INFO": 20, "WARN": 30, "ERROR": 40}
 _log_fh = None
+_log_level = "INFO"
 
-# ===== LOG =====
-def log(msg):
-    if not DEBUG: return
-    print(msg)
-    if _log_fh:
-        try: _log_fh.write(msg + "\n"); _log_fh.flush()
-        except Exception: pass
+def set_log_level(level):
+    global _log_level
+    if level in LOG_LEVELS:
+        _log_level = level
+
+def log(msg, level="INFO"):
+    if _log_fh is None: return
+    if LOG_LEVELS.get(level, 0) < LOG_LEVELS.get(_log_level, 0): return
+    if level != "INFO":
+        msg = f"[{level}] {msg}"
+    try:
+        _log_fh.write(msg + "\n"); _log_fh.flush()
+    except Exception: pass
 
 def set_log_fh(fh):
     global _log_fh
     _log_fh = fh
 
-# ===== ESCAPE =====
 def escape_for_parse(s):
     if s.lstrip().startswith("\\"):
         return PH_OPEN + s + PH_CLOSE
@@ -45,7 +50,6 @@ def escape_nl(s):
 def unescape_nl(s):
     return s.replace(ESC_NL, "\n")
 
-# ===== NAME VALIDATOR =====
 BAD_NAME_CHARS = set('=><\\,;?/:"`\'')
 def valid_name(n):
     if not n: return False
@@ -54,64 +58,110 @@ def valid_name(n):
         if ch in BAD_NAME_CHARS: return False
     return True
 
-# ===== EVAL =====
+def _is_number(s):
+    try:
+        float(s); return True
+    except (ValueError, TypeError):
+        return False
+
 def apply_op(prev, op, right):
+    if op == "+":
+        if not (_is_number(prev) and _is_number(right)):
+            v = str(prev) + str(right)
+            log(f"[apply_op] {prev!r} + {right!r} (str) -> {v!r}", "DEBUG")
+            return v
     try:
         e = f"({prev}) {op} ({right})"
         if op == "^": e = f"({prev}) ** ({right})"
         v = eval(e, {"__builtins__":{}, "math": math}, {})
-        if isinstance(v, bool): return "1" if v else "0"
-        if isinstance(v, float) and v.is_integer(): return str(int(v))
-        return str(v)
+        if isinstance(v, bool): v = "1" if v else "0"
+        elif isinstance(v, float) and v.is_integer(): v = str(int(v))
+        else: v = str(v)
+        log(f"[apply_op] {prev!r} {op} {right!r} -> {v!r}", "DEBUG")
+        return v
     except Exception:
+        log(f"[apply_op] FAIL {prev!r} {op} {right!r} -> {prev!r}", "WARN")
         return str(prev)
 
 def eval_expr(expr, mem):
     e = expr.strip()
+    log(f"[eval_expr] {expr!r} mem={mem}", "DEBUG")
+    if "?" in e and ":" in e:
+        try:
+            qpos = e.find("?"); cpos = e.rfind(":")
+            if 0 < qpos < cpos:
+                cond = e[:qpos].strip(); a = e[qpos+1:cpos].strip(); b = e[cpos+1:].strip()
+                r = eval_expr(a if entails(cond, mem) else b, mem)
+                log(f"[eval_expr] ternary {cond!r} -> {r!r}", "DEBUG")
+                return r
+        except Exception: pass
+    orig = e
+    e = e.replace("= =", "==").replace("! =", "!=").replace("> =", ">=").replace("< =", "<=")
     for name in sorted(mem.keys(), key=len, reverse=True):
         if name.startswith("::"): continue
         e = re.sub(r'\b' + re.escape(name) + r'\b', str(mem[name]), e)
+    if e != orig: log(f"[eval_expr] subst {orig!r} -> {e!r}", "DEBUG")
     try:
         e2 = e.replace("^","**").replace("&&"," and ").replace("||"," or ")
         e2 = re.sub(r'\bsqrt\s*\(', 'math.sqrt(', e2)
         e2 = re.sub(r'\bsin\s*\(', 'math.sin(', e2)
         e2 = re.sub(r'\bcos\s*\(', 'math.cos(', e2)
         v = eval(e2, {"__builtins__":{}, "math": math}, {})
-        if isinstance(v, bool): return "1" if v else "0"
-        if isinstance(v, float) and v.is_integer(): return str(int(v))
-        return str(v)
-    except Exception:
-        return expr
+        if isinstance(v, bool): v = "1" if v else "0"
+        elif isinstance(v, float) and v.is_integer(): v = str(int(v))
+        else: v = str(v)
+        log(f"[eval_expr] -> {v!r}", "DEBUG")
+        return v
+    except Exception as ex:
+        if e != orig:
+            stripped = e.rstrip(" +-*/%^")
+            r = stripped if stripped != "" else ""
+        else:
+            r = orig
+        log(f"[eval_expr] FAIL {e!r} ({ex}) -> {r!r}", "WARN")
+        return r
 
 def entails(phi, mem):
     v = eval_expr(phi, mem)
-    if v is None: return False
-    if isinstance(v, bool): return v
-    s = str(v).strip()
-    return s not in ("0", "", "False", "⊥")
+    if v is None: r = False
+    elif isinstance(v, bool): r = v
+    else:
+        s = str(v).strip()
+        if "=" in s or "<" in s or ">" in s:
+            r = False
+        else:
+            r = s not in ("0", "", "False", "⊥")
+    log(f"[entails] {phi!r} -> {r}", "DEBUG")
+    return r
 
-# ===== SPLIT / JOIN / AXIS =====
 def split_by_sep(s, sep):
-    if sep and sep in s: return s.split(sep)
-    if not sep: return list(s)
-    if "," in s: return [x.strip() for x in s.split(",")]
-    return [s]
+    if not s: r = []
+    elif sep and sep in s: r = s.split(sep)
+    elif not sep: r = list(s)
+    elif "," in s: r = [x.strip() for x in s.split(",")]
+    else: r = [s]
+    log(f"[split_by_sep] {s!r} sep={sep!r} -> {r!r}", "DEBUG")
+    return r
 
 def join_by_sep(items, sep):
-    if not sep: return "".join(items)
-    if sep == ", ": return ", ".join(items)
-    if sep == "\n": return "\n".join(items)
-    return sep.join(items)
+    if not sep: r = "".join(items)
+    elif sep == ", ": r = ", ".join(items)
+    elif sep == "\n": r = "\n".join(items)
+    else: r = sep.join(items)
+    log(f"[join_by_sep] {items!r} sep={sep!r} -> {r!r}", "DEBUG")
+    return r
 
 def axis_index(idx, items, mem=None):
-    if idx in (None, "", "all"): return None
-    if idx == "last": return len(items) - 1
-    if idx == "first": return 0
-    if mem and idx in mem: idx = mem[idx]
-    try: return int(idx) - 1
-    except (ValueError, TypeError): return None
+    if idx in (None, "", "all"): r = None
+    elif idx == "last": r = len(items) - 1
+    elif idx == "first": r = 0
+    else:
+        if mem and idx in mem: idx = mem[idx]
+        try: r = int(idx) - 1
+        except (ValueError, TypeError): r = None
+    log(f"[axis_index] {idx!r} items={items!r} -> {r}", "DEBUG")
+    return r
 
-# ===== REF PARSING =====
 QUAL_RE    = re.compile(r'^(?:(?P<cycle>[\w.]+):)?(?P<rest>.+)$')
 AXIS_RE    = re.compile(r'^(?P<base>[\w.]+):(?P<axis>[xy])(?:\((?P<sep>[^)]*)\))?(?::(?P<idx>[\w]+))?$')
 AXIS_CHAIN_RE = re.compile(r'^(?P<base>[\w.]+)(?P<axes>(?::[xy](?:\([^)]*\))?(?::[\w]+)?)+)$')
@@ -141,34 +191,51 @@ def parse_line_ref(ref):
 
 def parse_ref(ref):
     ref = ref.strip()
-    if not ref: return None
-    if ref.startswith(":"):
+    if not ref: r = None
+    elif ref.startswith(":"):
         pl = parse_line_ref(ref)
-        if pl: return {"kind":"line","cycle":pl[0],"n":pl[1]}
-        parts = ref.strip(":").split(":")
-        if len(parts) == 2 and parts[1].isdigit():
-            return {"kind":"line","cycle":parts[0],"n":int(parts[1])}
-        return None
-    m = QUAL_RE.match(ref)
-    if not m: return None
-    cycle = m.group("cycle"); rest = m.group("rest")
-    if cycle and rest.isdigit():
-        return {"kind":"line","cycle":cycle,"n":int(rest)}
-    if cycle and rest.startswith("line:"):
-        try: n = int(rest[5:])
-        except Exception: return None
-        return {"kind":"line","cycle":cycle,"n":n}
-    chain = parse_axis_chain(rest)
-    if chain:
-        base, parts = chain
-        return {"kind":"axis_chain","cycle":cycle,"base":base,"parts":parts}
-    p = parse_axis_ref(rest)
-    if p:
-        base, axis, sep, idx = p
-        return {"kind":"axis","cycle":cycle,"base":base,"axis":axis,"sep":sep,"idx":idx}
-    return {"kind":"name","cycle":cycle,"base":rest,"axis":None,"sep":None,"idx":None}
+        if pl: r = {"kind":"line","cycle":pl[0],"n":pl[1]}
+        else:
+            parts = ref.strip(":").split(":")
+            if len(parts) == 2 and parts[1].isdigit():
+                r = {"kind":"line","cycle":parts[0],"n":int(parts[1])}
+            else: r = None
+    else:
+        p = parse_axis_ref(ref)
+        if p:
+            base, axis, sep, idx = p
+            r = {"kind":"axis","cycle":None,"base":base,"axis":axis,"sep":sep,"idx":idx}
+        else:
+            chain = parse_axis_chain(ref)
+            if chain:
+                base, parts = chain
+                r = {"kind":"axis_chain","cycle":None,"base":base,"parts":parts}
+            else:
+                m = QUAL_RE.match(ref)
+                if not m: r = None
+                else:
+                    cycle = m.group("cycle"); rest = m.group("rest")
+                    if cycle and rest.isdigit():
+                        r = {"kind":"line","cycle":cycle,"n":int(rest)}
+                    elif cycle and rest.startswith("line:"):
+                        try: n = int(rest[5:])
+                        except Exception: n = 0
+                        r = {"kind":"line","cycle":cycle,"n":n}
+                    else:
+                        p2 = parse_axis_ref(rest)
+                        if p2:
+                            base, axis, sep, idx = p2
+                            r = {"kind":"axis","cycle":cycle,"base":base,"axis":axis,"sep":sep,"idx":idx}
+                        else:
+                            chain2 = parse_axis_chain(rest)
+                            if chain2:
+                                base, parts = chain2
+                                r = {"kind":"axis_chain","cycle":cycle,"base":base,"parts":parts}
+                            else:
+                                r = {"kind":"name","cycle":cycle,"base":rest,"axis":None,"sep":None,"idx":None}
+    log(f"[parse_ref] {ref!r} -> {r}", "DEBUG")
+    return r
 
-# ===== MEMORY =====
 def mem_of(model, cycle_name, cur_cyc_name):
     if cycle_name:
         for c in model["cycles"]:
@@ -217,24 +284,26 @@ def write_axis_chain(mem, base, parts, value, op):
 
 def read_ref(model, cyc, ref):
     p = parse_ref(ref)
-    if not p: return None
-    mem = mem_of(model, p["cycle"], cyc["name"])
-    if mem is None: return None
-    if p["kind"] == "name": return mem.get(p["base"])
-    if p["kind"] == "axis":
-        sep_eff = p["sep"] if p["sep"] is not None else ("\n" if p["axis"]=="y" else "")
-        items = split_by_sep(mem.get(p["base"], ""), sep_eff)
-        i = axis_index(p["idx"], items, mem)
-        return items[i] if i is not None and 0 <= i < len(items) else None
-    if p["kind"] == "axis_chain":
-        return read_axis_chain(mem, p["base"], p["parts"])
-    if p["kind"] == "line":
-        for c in model["cycles"]:
-            if (p["cycle"] or cyc["name"]) == c["name"]:
-                if 0 <= p["n"]-1 < len(c["lines"]):
-                    return c["lines"][p["n"]-1]
-        return None
-    return None
+    if not p: r = None
+    else:
+        mem = mem_of(model, p["cycle"], cyc["name"])
+        if mem is None: r = None
+        elif p["kind"] == "name": r = mem.get(p["base"])
+        elif p["kind"] == "axis":
+            sep_eff = p["sep"] if p["sep"] is not None else ("\n" if p["axis"]=="y" else "")
+            items = split_by_sep(mem.get(p["base"], ""), sep_eff)
+            i = axis_index(p["idx"], items, mem)
+            r = items[i] if i is not None and 0 <= i < len(items) else None
+        elif p["kind"] == "axis_chain": r = read_axis_chain(mem, p["base"], p["parts"])
+        elif p["kind"] == "line":
+            r = None
+            for c in model["cycles"]:
+                if (p["cycle"] or cyc["name"]) == c["name"]:
+                    if 0 <= p["n"]-1 < len(c["lines"]):
+                        r = c["lines"][p["n"]-1]
+        else: r = None
+    log(f"[read_ref] {ref!r} -> {r!r}", "DEBUG")
+    return r
 
 def write_ref(model, cyc, ref, value, op="=>"):
     p = parse_ref(ref)
@@ -242,7 +311,9 @@ def write_ref(model, cyc, ref, value, op="=>"):
     mem = mem_of(model, p["cycle"], cyc["name"])
     if mem is None: return False
     if p["kind"] == "name":
-        mem[p["base"]] = value; return True
+        mem[p["base"]] = value
+        log(f"[write_ref] {ref!r} = {value!r} (name)", "DEBUG")
+        return True
     if p["kind"] == "axis":
         base, axis, sep, idx = p["base"], p["axis"], p["sep"], p["idx"]
         sep_eff = sep if sep is not None else ("\n" if axis=="y" else "")
@@ -259,14 +330,20 @@ def write_ref(model, cyc, ref, value, op="=>"):
                 try: items.insert(int(idx)-1, value)
                 except Exception: items.append(value)
             else: items.append(value)
-        mem[base] = join_by_sep(items, sep_eff); return True
+        mem[base] = join_by_sep(items, sep_eff)
+        log(f"[write_ref] {ref!r} = {value!r} (axis) -> {mem[base]!r}", "DEBUG")
+        return True
     if p["kind"] == "axis_chain":
-        return write_axis_chain(mem, p["base"], p["parts"], value, op)
+        ok = write_axis_chain(mem, p["base"], p["parts"], value, op)
+        log(f"[write_ref] {ref!r} = {value!r} (chain) -> {ok}", "DEBUG")
+        return ok
     if p["kind"] == "line":
         for c in model["cycles"]:
             if (p["cycle"] or cyc["name"]) == c["name"]:
                 if 0 <= p["n"]-1 < len(c["lines"]):
-                    c["lines"][p["n"]-1] = value; return True
+                    c["lines"][p["n"]-1] = value
+                    log(f"[write_ref] {ref!r} = {value!r} (line)", "DEBUG")
+                    return True
         return False
     return False
 
@@ -308,8 +385,13 @@ def remove_ref(model, cyc, ref):
     if p["kind"] == "name":
         mem = mem_of(model, p["cycle"], cyc["name"])
         if mem is None: return False
-        mem.pop(p["base"], None); return True
-    if p["kind"] == "axis": return remove_from_axis(model, cyc, ref)
+        mem.pop(p["base"], None)
+        log(f"[remove_ref] {ref!r} (name)", "DEBUG")
+        return True
+    if p["kind"] == "axis":
+        ok = remove_from_axis(model, cyc, ref)
+        log(f"[remove_ref] {ref!r} (axis) -> {ok}", "DEBUG")
+        return ok
     if p["kind"] == "line": return remove_line(model, cyc, ref)
     return False
 

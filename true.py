@@ -1,8 +1,5 @@
-# true.py — core of true language (no agent; agent is part of creator)
+# true.py — core of true language
 # Version: 0.9.9
-# Axes: only x (chars) and y (lines), no z
-
-# ===== IMPORTS =====
 import re, math, os
 from modules import (
     PHI, DEBUG, ESC_NL, ESC_CHAR, PH_OPEN, PH_CLOSE, HISTORY_MAX,
@@ -19,7 +16,6 @@ from modules import (
     QUAL_RE, AXIS_RE, AXIS_CHAIN_RE, LINE_RE,
 )
 
-# ===== LEXER =====
 class Token:
     __slots__ = ("type", "value", "line", "col")
     def __init__(self, type_, value, line=0, col=0):
@@ -59,11 +55,15 @@ def _tokenize_cycle_line(line, lineno):
         ch = line[i]
         if ch.isspace(): i += 1; continue
         if ch == "\\" and i + 1 < n:
-            tokens.append(Token(STRING, line[i+1], lineno, i)); i += 2; continue
+            nxt = line[i+1]
+            if nxt == "n":
+                tokens.append(Token(STRING, ESC_NL, lineno, i)); i += 2; continue
+            tokens.append(Token(STRING, nxt, lineno, i)); i += 2; continue
         if ch == ":" and i + 1 < n and line[i+1] == ":":
             j = i + 2
             while j < n and (line[j].isalnum() or line[j] in "._!"): j += 1
             tokens.append(Token(EXT, line[i:j], lineno, i)); i = j; continue
+        if line.startswith("?=>|", i): tokens.append(Token(OP, "?=>|", lineno, i)); i += 4; continue
         if line.startswith("=>|", i): tokens.append(Token(OP, "=>|", lineno, i)); i += 3; continue
         if line.startswith("->|", i): tokens.append(Token(OP, "->|", lineno, i)); i += 3; continue
         if line.startswith("<->", i): tokens.append(Token(OP, "<->", lineno, i)); i += 3; continue
@@ -72,7 +72,22 @@ def _tokenize_cycle_line(line, lineno):
         if line.startswith("->", i): tokens.append(Token(OP, "->", lineno, i)); i += 2; continue
         if ch == "?": tokens.append(Token(COND, "?", lineno, i)); i += 1; continue
         if ch == "=": tokens.append(Token(EQ, "=", lineno, i)); i += 1; continue
-        if ch == "(": tokens.append(Token(LPAREN, "(", lineno, i)); i += 1; continue
+        if ch == "(":
+            j = i + 1; depth = 1
+            while j < n and depth > 0:
+                if line[j] == "(": depth += 1
+                elif line[j] == ")": depth -= 1
+                j += 1
+            sep_text = line[i+1:j-1] if depth == 0 else line[i+1:]
+            tokens.append(Token(LPAREN, "(", lineno, i))
+            if sep_text:
+                tokens.append(Token(STRING, sep_text, lineno, i+1))
+            if depth == 0:
+                tokens.append(Token(RPAREN, ")", lineno, j-1))
+                i = j
+            else:
+                i = n
+            continue
         if ch == ")": tokens.append(Token(RPAREN, ")", lineno, i)); i += 1; continue
         if ch == ",": tokens.append(Token(COMMA, ",", lineno, i)); i += 1; continue
         if ch == ":": tokens.append(Token(COLON, ":", lineno, i)); i += 1; continue
@@ -92,7 +107,6 @@ def _tokenize_cycle_line(line, lineno):
         tokens.append(Token(STRING, ch, lineno, i)); i += 1
     return tokens
 
-# ===== AST =====
 class Node:
     def __repr__(self): return f"{self.__class__.__name__}({self.__dict__})"
 
@@ -122,7 +136,6 @@ class ExprNode(Node):
         self.kind = kind; self.value = value
         self.left = left; self.op = op; self.right = right
 
-# ===== PARSER =====
 class CycleParser:
     def __init__(self, tokens):
         self.tokens = tokens; self.pos = 0
@@ -149,6 +162,21 @@ class CycleParser:
         if t0.type == VERSION: return VersionNode(t0.value)
         if t0.type == SEP: return SeparatorNode()
         if t0.type == JUMP: return JumpNode(t0.value)
+        if t0.type == EXT:
+            full = t0.value
+            j = 1
+            while j < len(tokens):
+                if tokens[j].type == COLON and j + 1 < len(tokens) and tokens[j+1].type == NAME:
+                    full += ":" + tokens[j+1].value
+                    j += 2
+                else:
+                    break
+            return ActionNode(
+                [RefNode("name", base="")],
+                ["=>"],
+                [RefNode("name", base=full)],
+                [False]
+            )
         if any(t.type == COND for t in tokens): return self._parse_condition(tokens)
         if any(t.type == OP for t in tokens): return self._parse_action(tokens)
         if any(t.type == EQ for t in tokens): return self._parse_named(tokens)
@@ -166,10 +194,18 @@ class CycleParser:
     def _parse_expr(self, tokens):
         if not tokens:
             return ExprNode("literal", value="")
-        s = " ".join(t.value for t in tokens)
+        parts = []
+        prev_eq = False
+        for t in tokens:
+            if t.type == EQ and prev_eq:
+                parts[-1] += "="
+                prev_eq = True
+                continue
+            parts.append(t.value)
+            prev_eq = (t.type == EQ)
+        s = " ".join(parts)
         return ExprNode("raw", value=s)
     def _parse_action(self, tokens):
-        srcs = []; ops = []; dsts = []; evals = []
         segments = []; cur = []
         for t in tokens:
             if t.type == OP:
@@ -181,13 +217,14 @@ class CycleParser:
             else:
                 cur.append(t)
         if cur: segments.append(("src", cur))
+        srcs = []; ops = []; dsts = []; evals = []
         for kind, val in segments:
             if kind == "src":
                 if not val: continue
-                if ops and len(srcs) > len(dsts):
-                    dsts.append(self._parse_ref(val))
-                else:
+                if not ops:
                     srcs.append(self._parse_ref(val))
+                else:
+                    dsts.append(self._parse_ref(val))
             elif kind == "op":
                 ops.append(val)
                 evals.append(val.startswith("?"))
@@ -206,15 +243,13 @@ class CycleParser:
             if seen: name_tokens.append(t)
             else: val_tokens.append(t)
         val = " ".join(t.value for t in val_tokens)
+        val = val.replace(" " + ESC_NL + " ", ESC_NL)
+        val = val.replace(ESC_NL + " ", ESC_NL).replace(" " + ESC_NL, ESC_NL)
+        val = re.sub(r'\s*,\s*', ', ', val)
         names = [t.value for t in name_tokens if t.type == NAME]
         return NamedNode(val, names)
     def _parse_ref(self, tokens):
         if not tokens: return RefNode("name", base="")
-        if len(tokens) >= 3 and tokens[0].type == NAME and tokens[1].type == COLON:
-            cycle = tokens[0].value
-            node = self._parse_ref(tokens[2:])
-            node.cycle = cycle
-            return node
         if tokens[0].type == COLON:
             rest = tokens[1:]
             if len(rest) >= 1 and rest[0].type == NAME and rest[0].value == "line":
@@ -227,17 +262,16 @@ class CycleParser:
                 try: n = int(rest[2].value)
                 except Exception: n = 0
                 return RefNode("line", cycle=cycle, n=n)
-        if len(tokens) >= 3 and tokens[0].type == NAME and tokens[1].type == COLON:
+        if len(tokens) >= 3 and tokens[0].type == NAME and tokens[1].type == COLON and tokens[2].type == NAME and tokens[2].value in ("x", "y"):
             base = tokens[0].value
             parts = []; i = 2
             while i < len(tokens):
                 if tokens[i].type == NAME and tokens[i].value in ("x", "y"):
                     axis = tokens[i].value; sep = None; idx = None; i += 1
                     if i < len(tokens) and tokens[i].type == LPAREN:
-                        i += 1; sep_chars = []
-                        while i < len(tokens) and tokens[i].type != RPAREN:
-                            sep_chars.append(tokens[i].value); i += 1
-                        sep = "".join(sep_chars)
+                        i += 1
+                        if i < len(tokens) and tokens[i].type == STRING:
+                            sep = tokens[i].value; i += 1
                         if i < len(tokens) and tokens[i].type == RPAREN: i += 1
                     if i < len(tokens) and tokens[i].type == COLON:
                         i += 1
@@ -249,6 +283,11 @@ class CycleParser:
                 axis, sep, idx = parts[0]
                 return RefNode("axis", base=base, axis=axis, sep=sep, idx=idx)
             return RefNode("axis_chain", base=base, parts=parts)
+        if len(tokens) >= 3 and tokens[0].type == NAME and tokens[1].type == COLON:
+            cycle = tokens[0].value
+            node = self._parse_ref(tokens[2:])
+            node.cycle = cycle
+            return node
         if len(tokens) == 1 and tokens[0].type == NAME:
             return RefNode("name", base=tokens[0].value)
         if len(tokens) == 1 and tokens[0].type == NUMBER:
@@ -258,34 +297,37 @@ class CycleParser:
 def _parse_cycle_line(line):
     return CycleParser(_tokenize_cycle_line(line + "\n", 1)).parse()
 
-# ===== REGEX =====
 JUMP_RE    = re.compile(r'^\^\s*(?P<target>.+)$')
 COND_RE    = re.compile(r'^(?P<cond>.+?)(?<!\?)\?\s*(?!=>\||->\||<->|=>|->)(?P<act>.*)$')
 NAMED_RE   = re.compile(r'^(?P<val>.*?)\s*=\s*(?P<names>[\w.,\s]+)$')
 ACTION_OP  = re.compile(r'(?<!\u0002)(\?)?(=>\||->\||<->|=>|->)')
 VERSION_RE = re.compile(r'^\s*#\s*version:\s*(\d+)\s*$')
 
-# ===== RESOLVE LINE =====
 def resolve_line(line):
     try:
         nodes = _parse_cycle_line(line)
     except Exception as e:
-        log(f"[parser] error: {e}")
+        log(f"[parser] error: {e}", "WARN")
         nodes = []
-    if not nodes: return _resolve_line_regex(line)
-    n = nodes[0]
-    if isinstance(n, VersionNode): return "version", n
-    if isinstance(n, SeparatorNode): return "separator", None
-    if isinstance(n, JumpNode): return "jump", n
-    if isinstance(n, ConditionNode): return "condition", n
-    if isinstance(n, ActionNode): return "action", n
-    if isinstance(n, NamedNode): return "named", n
-    if isinstance(n, ContainerNode): return "container", n
-    return "container", None
+    if not nodes: typ = _resolve_line_regex(line)
+    else:
+        n = nodes[0]
+        if isinstance(n, VersionNode): typ = ("version", n)
+        elif isinstance(n, SeparatorNode): typ = ("separator", None)
+        elif isinstance(n, JumpNode): typ = ("jump", n)
+        elif isinstance(n, ConditionNode): typ = ("condition", n)
+        elif isinstance(n, ActionNode): typ = ("action", n)
+        elif isinstance(n, NamedNode): typ = ("named", n)
+        elif isinstance(n, ContainerNode): typ = ("container", n)
+        else: typ = ("container", None)
+    log(f"[resolve_line] {line!r} -> {typ[0]}", "DEBUG")
+    return typ
 
 def _resolve_line_regex(line):
     if VERSION_RE.match(line): return "version", VERSION_RE.match(line)
     if line.lstrip().startswith("\\"): return "container", None
+    if line.lstrip().startswith("::"):
+        return "action", None
     line_esc = escape_for_parse(line)
     if not line_esc.strip() or line_esc.strip() == "---": return "separator", None
     if JUMP_RE.match(line_esc) and not line_esc.startswith(PH_OPEN): return "jump", JUMP_RE.match(line_esc)
@@ -302,7 +344,6 @@ def _resolve_line_regex(line):
     if NAMED_RE.match(line_esc): return "named", NAMED_RE.match(line_esc)
     return "container", None
 
-# ===== FIND LINE BY NAME =====
 def find_line_by_name(lines, name, model=None, cycle_name=None):
     if model is not None and cycle_name is not None:
         idx_cache = model.setdefault("name_index", {}).setdefault(cycle_name, None)
@@ -335,7 +376,6 @@ def _invalidate_name_index(model, cycle_name):
     if "name_index" in model and cycle_name in model["name_index"]:
         del model["name_index"][cycle_name]
 
-# ===== DO JUMP =====
 def do_jump(model, cyc, target):
     t = target.strip()
     if t.startswith(":"):
@@ -352,26 +392,53 @@ def do_jump(model, cyc, target):
                         idx = find_line_by_name(model["cycles"][i]["lines"], target2, model, cycle_name)
                         if idx >= 0: model["cycles"][i]["agent_pos"] = idx
                         else: return False
+                    log(f"[jump] -> cycle={cycle_name} agent_pos={model['cycles'][i]['agent_pos']}", "DEBUG")
                     return True
         return False
     if t.isdigit():
         n_int = int(t) - 1
         cyc["agent_pos"] = max(0, min(n_int, len(cyc["lines"])-1))
+        log(f"[jump] ^ {t} -> agent_pos={cyc['agent_pos']}", "DEBUG")
         return True
     idx = find_line_by_name(cyc["lines"], t, model, cyc["name"])
-    if idx >= 0: cyc["agent_pos"] = idx; return True
+    if idx >= 0:
+        cyc["agent_pos"] = idx
+        log(f"[jump] ^ {t!r} -> agent_pos={cyc['agent_pos']}", "DEBUG")
+        return True
     return False
 
-# ===== EXTENSIONS =====
 EXTENSIONS = {}
 def register_extension(name, fn): EXTENSIONS[name] = fn
 
 def ext_math(model, cyc, src, dst, op, eval_flag, bridge):
     mem = model["memory"].setdefault(cyc["name"], {})
-    mem["::math"] = eval_expr(src, mem); return True
+    mem["::math"] = eval_expr(src, mem)
+    log(f"[ext_math] {src!r} -> {mem['::math']!r}", "DEBUG")
+    return True
 
 def ext_nothing(model, cyc, src, dst, op, eval_flag, bridge):
-    if op in ("->", "->|"): remove_ref(model, cyc, src)
+    if op in ("->", "->|"):
+        remove_ref(model, cyc, src)
+        log(f"[ext_nothing] removed {src!r}", "DEBUG")
+    return True
+
+def ext_random(model, cyc, src, dst, op, eval_flag, bridge):
+    import random as _r
+    mem = model["memory"].setdefault(cyc["name"], {})
+    lo, hi = 1, 6
+    if src:
+        parts = [p.strip() for p in src.split(",") if p.strip()]
+        if len(parts) >= 2:
+            try: lo = int(float(eval_expr(parts[0], mem))); hi = int(float(eval_expr(parts[1], mem)))
+            except Exception: pass
+        elif len(parts) == 1:
+            try: hi = int(float(eval_expr(parts[0], mem)))
+            except Exception: pass
+    v = str(_r.randint(lo, hi))
+    mem["::random"] = v
+    if dst and dst != "::random":
+        write_ref(model, cyc, dst, v, op=op)
+    log(f"[ext_random] {lo}..{hi} -> {v}", "DEBUG")
     return True
 
 def _load_file_text(model, name_or_path):
@@ -417,12 +484,18 @@ def _substitute(text, args):
 
 def ext_gen(model, cyc, src, dst, op, eval_flag, bridge):
     if not src: return False
-    args = _parse_gen_args(src)
-    template_name = None
-    if dst and dst != "::gen": template_name = dst
-    elif "args" in args: template_name = args.pop("args")
-    else: return False
+    mem = model["memory"].setdefault(cyc["name"], {})
+    parts = [p.strip() for p in src.split(",") if p.strip()]
+    if not parts: return False
+    template_name = parts[0]
+    args = {}
+    if len(parts) > 1:
+        arg_name = parts[1]
+        raw = mem.get(arg_name, arg_name)
+        args = _parse_gen_args(raw)
     template_text = _load_file_text(model, template_name)
+    if template_text is None:
+        template_text = _load_file_text(model, template_name + ".txt")
     if template_text is None: return False
     new_text = _substitute(template_text, args)
     base_name = os.path.basename(template_name).rsplit(".", 1)[0]
@@ -433,50 +506,88 @@ def ext_gen(model, cyc, src, dst, op, eval_flag, bridge):
         counter += 1
         new_name = f"{base_name}_{counter}.cycle"
     model["cycles"].append({"name": new_name, "lines": new_text.split("\n"),
-                            "agent_pos": 0, "color": "#5fb85f", "loop": True, "has_agent": False})
+                            "agent_pos": 0, "color": "#5fb85f", "loop": False, "has_agent": False})
     _invalidate_name_index(model, new_name)
     base_dir = os.path.dirname(os.path.abspath(__file__))
     try:
         with open(os.path.join(base_dir, new_name), "w", encoding="utf-8") as f:
             f.write(new_text)
     except Exception: pass
-    mem = model["memory"].setdefault(cyc["name"], {})
     mem["::gen"] = new_name
     mem["gen"] = new_name
+    log(f"[ext_gen] {template_name!r} -> {new_name!r}", "DEBUG")
     return True
 
 def ext_check(model, cyc, src, dst, op, eval_flag, bridge):
     if not src: return False
-    args_str = src
-    if "= args" in args_str: args_str = args_str.split("= args")[0].strip()
-    target = None
-    if dst and dst != "::check": target = dst
-    elif "args" in _parse_gen_args(src): target = _parse_gen_args(src).get("args")
-    if not target: return False
+    mem = model["memory"].setdefault(cyc["name"], {})
+    parts = [p.strip() for p in src.split(",") if p.strip()]
+    if not parts: return False
+    target = parts[0]
+    args_str = ""
+    if len(parts) > 1:
+        arg_name = parts[1]
+        args_str = mem.get(arg_name, arg_name)
     text = _load_file_text(model, target)
     if text is None: return False
     result = check_substrings(text, args_str)
-    mem = model["memory"].setdefault(cyc["name"], {})
     mem["::check"] = result
     mem["check"] = result
+    log(f"[ext_check] {target!r} -> {result!r}", "DEBUG")
     return True
 
 register_extension("math", ext_math)
 register_extension("nothing", ext_nothing)
+register_extension("random", ext_random)
 register_extension("gen", ext_gen)
 register_extension("check", ext_check)
 
-# ===== ACTION EXECUTION =====
 def _apply_single_op(model, cyc, src_raw, op, dst, eval_flag, bridge=None):
     mem = model["memory"].setdefault(cyc["name"], {})
+    log(f"[apply] src={src_raw!r} op={op!r} dst={dst!r} eval={eval_flag} mem={mem}", "DEBUG")
     if dst in mem and isinstance(mem[dst], str) and mem[dst].startswith("::"):
         dst = mem[dst]
+    if dst.startswith("::!"):
+        fname = dst[3:]
+        args = []
+        if src_raw:
+            sv = read_ref(model, cyc, src_raw)
+            if sv is None: sv = mem.get(src_raw, src_raw)
+            args = [sv]
+        r = None
+        if bridge is not None and hasattr(bridge, "call_fn"):
+            r = bridge.call_fn(fname, args)
+        if r is not None:
+            mem[fname] = r
+            mem[":!" + fname] = r
+        log(f"[apply] ::!{fname} -> {r!r}", "DEBUG")
+        return
     if dst.startswith("::"):
         ext_name = dst[2:].split(":")[0]
         fn = EXTENSIONS.get(ext_name)
-        if fn: fn(model, cyc, src_raw, dst, op, eval_flag, bridge); return
+        if fn:
+            fn(model, cyc, src_raw, dst, op, eval_flag, bridge)
+            log(f"[apply] ::{ext_name} done, mem={mem}", "DEBUG")
+        return
+    if dst.startswith(":") and not dst.startswith("::"):
+        fname = dst[1:]
+        args = []
+        if src_raw:
+            sv = read_ref(model, cyc, src_raw)
+            if sv is None: sv = mem.get(src_raw, src_raw)
+            args = [sv]
+        r = None
+        if bridge is not None and hasattr(bridge, "call_fn"):
+            r = bridge.call_fn(fname, args)
+        if r is not None:
+            mem[fname] = r
+            mem[":!" + fname] = r
+        log(f"[apply] :{fname} -> {r!r}", "DEBUG")
+        return
     if op == "<->":
-        if swap_axis(mem, src_raw, dst): return
+        if swap_axis(mem, src_raw, dst):
+            log(f"[apply] <-> {src_raw!r} {dst!r} mem={mem}", "DEBUG")
+            return
     if op == "^":
         do_jump(model, cyc, dst); return
     if "," in src_raw and not parse_axis_ref(src_raw) and not parse_line_ref(src_raw):
@@ -488,12 +599,17 @@ def _apply_single_op(model, cyc, src_raw, op, dst, eval_flag, bridge=None):
         else:
             sv = read_ref(model, cyc, src)
             if sv is None: sv = mem.get(src, src)
-        targets = [t.strip() for t in dst.split(",") if t.strip()] or [dst]
+        if "," in dst and not parse_axis_ref(dst) and not parse_line_ref(dst):
+            targets = [t.strip() for t in dst.split(",") if t.strip()]
+        else:
+            targets = [dst]
         for target in targets:
             if not valid_name(target) and not parse_axis_ref(target) and not parse_line_ref(target):
                 continue
             write_ref(model, cyc, target, sv, op=op)
             if op in ("->", "->|"): remove_ref(model, cyc, src)
+            log(f"[apply]   {src!r} -> {target!r} = {sv!r}", "DEBUG")
+    log(f"[apply] mem after={mem}", "DEBUG")
 
 def exec_action(model, cyc, line, bridge=None):
     if line.lstrip().startswith("\\"): return
@@ -517,6 +633,8 @@ def flush_memory_to_lines(cyc, model):
     mem = model["memory"].setdefault(cyc["name"], {})
     lines = cyc["lines"]
     for i, ln in enumerate(lines):
+        if i == 0 and cyc.get("has_agent"):
+            continue
         t, m = resolve_line(ln)
         if t == "named":
             names = []
@@ -532,12 +650,19 @@ def flush_memory_to_lines(cyc, model):
                 if new != ln:
                     lines[i] = new
                     _invalidate_name_index(model, cyc["name"])
+                    log(f"[flush] line {i}: {new!r}", "DEBUG")
 
 def _exec_action_ast(model, cyc, node, bridge=None):
     srcs, ops, dsts, evals = node.srcs, node.ops, node.dsts, node.evals
     for i, op in enumerate(ops):
-        src_node = srcs[i] if i < len(srcs) else None
+        if i == 0:
+            src_node = srcs[0] if srcs else None
+        else:
+            src_node = dsts[i-1] if i-1 < len(dsts) else None
         dst_node = dsts[i] if i < len(dsts) else None
+        if op == "^":
+            if dst_node: do_jump(model, cyc, _ref_to_str(dst_node))
+            continue
         if not src_node or not dst_node: continue
         src_ref = _ref_to_str(src_node); dst_ref = _ref_to_str(dst_node)
         eval_flag = evals[i] if i < len(evals) else False
@@ -563,14 +688,27 @@ def _ref_to_str(node):
     if node.kind == "jump_target": return node.base
     return ""
 
-# ===== EXECUTE LINE =====
 def execute_line(model, cyc, target_idx, bridge=None):
     line = cyc["lines"][target_idx]
     typ, node = resolve_line(line)
+    log(f"[execute_line] idx={target_idx} line={line!r} typ={typ}", "DEBUG")
     if typ == "named":
         mem = model["memory"].setdefault(cyc["name"], {})
         if isinstance(node, NamedNode):
             val = unescape_nl(unescape_after_parse(node.val))
+            if val == "":
+                collected = []
+                for j in range(target_idx - 1, -1, -1):
+                    if cyc.get("has_agent") and j == 0:
+                        break
+                    ln_j = cyc["lines"][j]
+                    t2, n2 = resolve_line(ln_j)
+                    if t2 == "container":
+                        text = n2.text if isinstance(n2, ContainerNode) else ln_j
+                        collected.insert(0, text)
+                    elif t2 in ("separator", "named", "condition", "action", "jump"):
+                        break
+                val = "\n".join(collected)
             for n in node.names:
                 if valid_name(n): mem[n] = val
         elif hasattr(node, "group"):
@@ -580,17 +718,29 @@ def execute_line(model, cyc, target_idx, bridge=None):
             for n in re.split(r'[,\s]+', names_raw):
                 if n and valid_name(n): mem[n] = val
         _invalidate_name_index(model, cyc["name"])
+        log(f"[execute_line] named -> mem={mem}", "DEBUG")
     elif typ == "condition":
         mem = model["memory"].setdefault(cyc["name"], {})
+        fired = False
         if isinstance(node, ConditionNode):
             cond_str = node.cond.value if hasattr(node.cond, "value") else str(node.cond)
             if entails(cond_str, mem) and node.act:
                 _exec_action_ast(model, cyc, node.act, bridge)
+                fired = True
         elif hasattr(node, "group"):
             cond = node.group("cond").strip()
             act = node.group("act").strip()
             if entails(cond, mem) and act:
                 exec_action(model, cyc, act, bridge)
+                fired = True
+        if fired:
+            j = target_idx + 1
+            while j < len(cyc["lines"]):
+                t2, _ = resolve_line(cyc["lines"][j])
+                if t2 == "separator":
+                    break
+                execute_line(model, cyc, j, bridge)
+                j += 1
     elif typ == "jump":
         if isinstance(node, JumpNode): do_jump(model, cyc, node.target)
         elif hasattr(node, "group"): do_jump(model, cyc, node.group("target"))
@@ -600,6 +750,7 @@ def execute_line(model, cyc, target_idx, bridge=None):
     elif typ == "version": pass
     elif typ == "container":
         text = node.text if isinstance(node, ContainerNode) else line
+        mem = model["memory"].setdefault(cyc["name"], {})
         for j in range(target_idx - 1, -1, -1):
             ln_j = cyc["lines"][j]
             t2, n2 = resolve_line(ln_j)
@@ -611,19 +762,19 @@ def execute_line(model, cyc, target_idx, bridge=None):
                     except Exception: names = []
                 if names:
                     primary = names[0]
-                    mem = model["memory"].setdefault(cyc["name"], {})
                     if primary in mem:
                         mem[primary] += "\n" + text; break
             elif t2 == "separator": break
+        log(f"[execute_line] container -> mem={mem}", "DEBUG")
     return typ
 
-# ===== STEP ENGINE =====
 def step_engine(model, bridge=None):
     event = {"kind": None, "cycle": None, "old": {}, "new": {}}
     if not model["cycles"]: return event
     cyc = model["cycles"][model["cur"]]
     event["cycle"] = cyc["name"]
     lines = cyc["lines"]; a = cyc.get("agent_pos", 0)
+    log(f"[step] cycle={cyc['name']!r} agent_pos={a} target={a+1} lines={lines}", "DEBUG")
     if not lines: return event
     loop = cyc.get("loop", True)
     target = a + 1
@@ -634,40 +785,50 @@ def step_engine(model, bridge=None):
             event["new"] = {"agent_pos": a, "lines": lines[:]}
             cyc["agent_pos"] = a
             model["playing"] = False
+            log(f"[step] END", "DEBUG")
             return event
         event["kind"] = "rotate"
-        agent_line = lines[a]
-        del lines[a]; lines.insert(0, agent_line)
         cyc["agent_pos"] = 0
         event["new"] = {"agent_pos": 0, "lines": lines[:]}
         _invalidate_name_index(model, cyc["name"])
+        log(f"[step] ROTATE -> agent_pos=0", "DEBUG")
         return event
     old_mem = dict(model["memory"].setdefault(cyc["name"], {}))
     old_lines = lines[:]; old_agent = a
-    if a == 0 and cyc.get("has_agent", False):
+    if target == 0:
         typ_target = "agent"
+        log(f"[step] target=0 -> agent line (skip)", "DEBUG")
     else:
         typ_target = execute_line(model, cyc, target, bridge)
+        log(f"[step] execute_line({target}) -> {typ_target}", "DEBUG")
     if typ_target == "jump":
         event["kind"] = "jump"
         event["old"] = {"agent_pos": old_agent, "mem": old_mem}
         event["new"] = {"agent_pos": cyc.get("agent_pos", 0), "mem": dict(model["memory"][cyc["name"]])}
+        log(f"[step] JUMP -> agent_pos={cyc.get('agent_pos')}", "DEBUG")
         return event
+    if typ_target == "condition":
+        j = target + 1
+        while j < len(cyc["lines"]):
+            t2, _ = resolve_line(cyc["lines"][j])
+            if t2 == "separator":
+                break
+            j += 1
+        target = j
     dirty = model.get("dirty", set())
     dirty.add(cyc["name"])
     for name in list(dirty):
         for c in model["cycles"]:
             if c["name"] == name: flush_memory_to_lines(c, model)
     model["dirty"] = set()
-    lines[a], lines[target] = lines[target], lines[a]
     cyc["agent_pos"] = target
     model["step_count"] = model.get("step_count", 0) + 1
     event["kind"] = "step"
     event["old"] = {"agent_pos": old_agent, "mem": old_mem, "lines": old_lines}
     event["new"] = {"agent_pos": target, "mem": dict(model["memory"][cyc["name"]]), "lines": lines[:]}
+    log(f"[step] STEP -> agent_pos={target} mem={model['memory'][cyc['name']]}", "DEBUG")
     return event
 
-# ===== HISTORY =====
 class History:
     def __init__(self, max_size=HISTORY_MAX):
         self.events = []; self.pos = -1; self.max_size = max_size

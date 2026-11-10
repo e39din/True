@@ -1,7 +1,5 @@
-# creator.py — heart of the system: agents, languages, extensions, OS, threads
+# creator.py — heart of the system
 # Version: true 0.9.9 / !true 0.9.6
-
-# ===== IMPORTS =====
 import re, os, glob, threading, time
 from modules import (
     PHI, DEBUG, ESC_NL, ESC_CHAR, PH_OPEN, PH_CLOSE, HISTORY_MAX,
@@ -13,7 +11,6 @@ from modules import (
 import true as T
 import not_true as NT
 
-# ===== UI BRIDGE =====
 class UIBridge:
     def __init__(s, app):
         s.app = app
@@ -40,8 +37,10 @@ class UIBridge:
     def refresh_ui(s):
         if s.app and hasattr(s.app, "root"):
             s.app.root.after(0, s.app.refresh_ui)
+    def call_fn(s, name, args):
+        funcs = getattr(s, "model", {}).get("functions", {})
+        return NT.call_fn(name, args, funcs)
 
-# ===== AGENT =====
 class Agent:
     def __init__(s, name="Mr.Green", color="#5fb85f", typ="", aim="", step=0, mode=1):
         s.name = name; s.color = color; s.typ = typ
@@ -82,7 +81,10 @@ class Agent:
                 except Exception: pass
         return True
 
-# ===== THREAD RUNNER =====
+    def to_line(s):
+        return (f"{s.name}, {s.color} | Data as <{s.typ}> | "
+                f"Aim: {s.aim} | step: {s.step} | mode: {s.mode}")
+
 class ThreadRunner:
     def __init__(s, creator, cycle_name):
         s.creator = creator
@@ -96,11 +98,13 @@ class ThreadRunner:
         s.stop_flag.clear()
         s.thread = threading.Thread(target=s._run, daemon=True)
         s.thread.start()
+        log(f"[thread] start {s.cycle_name}")
 
     def stop(s):
         s.stop_flag.set()
         agent = s.creator.agents.get(s.cycle_name)
         if agent: agent.running = False
+        log(f"[thread] stop {s.cycle_name}")
 
     def join(s, timeout=1.0):
         if s.thread and s.thread.is_alive():
@@ -110,40 +114,41 @@ class ThreadRunner:
         agent = s.creator.agents.get(s.cycle_name)
         mode = agent.mode if agent else 1
         if agent: agent.running = True
+        s.creator.ui.refresh_ui()
         try:
             while not s.stop_flag.is_set():
                 with s.creator.lock:
                     if not s.creator.model.get("playing"):
                         break
+                if s.stop_flag.is_set(): break
                 with s.lock:
                     with s.creator.lock:
                         ev = T.step_engine(s.creator.model, s.creator.ui)
                         s.creator.runner.history.record(ev)
                         ms = s.creator.model.get("ms", 390)
+                log(f"[thread] {s.cycle_name} ev.kind={ev.get('kind')}")
                 if agent:
-                    agent.step = s.creator.model.get("step_count", 0)
                     c = s.creator.model["cycles"][s.creator.model["cur"]]
                     pos = c.get("agent_pos", 0)
                     if 0 <= pos < len(c["lines"]):
                         agent.focus = c["lines"][pos]
                         typ, _ = T.resolve_line(agent.focus)
                         agent.line_type = typ
+                        agent.typ = typ
+                    agent.step = s.creator.model.get("step_count", 0)
+                    if c["lines"] and agent.parse(c["lines"][0]) is not False:
+                        c["lines"][0] = agent.to_line()
+                s.creator.ui.refresh_ui()
                 if mode == 1:
-                    s.creator.ui.refresh_ui()
-                    if ms > 0:
-                        time.sleep(ms / 1000.0)
+                    if ms > 0: time.sleep(ms / 1000.0)
                 else:
-                    if agent and agent.finished:
-                        s.creator.ui.refresh_ui()
-                        break
-                    if ev and ev.get("kind") == "end":
-                        s.creator.ui.refresh_ui()
-                        break
+                    if agent and agent.finished: break
+                    if ev and ev.get("kind") == "end": break
         finally:
             if agent: agent.running = False
             s.creator.ui.refresh_ui()
+            log(f"[thread] {s.cycle_name} finished")
 
-# ===== AGENT RUNNER =====
 class AgentRunner:
     def __init__(s, model, ui_bridge=None):
         s.model = model
@@ -154,11 +159,14 @@ class AgentRunner:
         if s.model.get("playing"): s.pause()
         ev = T.step_engine(s.model, s.ui)
         s.history.record(ev)
+        log(f"[runner] step_forward kind={ev.get('kind')}")
         return ev
 
     def step_back(s):
         if s.model.get("playing"): s.pause()
-        return s.history.undo(s.model)
+        ev = s.history.undo(s.model)
+        log(f"[runner] step_back -> {ev}")
+        return ev
 
     def reset(s):
         s.model["playing"] = False
@@ -167,12 +175,13 @@ class AgentRunner:
         s.model["memory"].clear()
         s.model["step_count"] = 0
         s.history.clear()
+        log(f"[runner] reset")
 
     def toggle(s):
         s.model["playing"] = not s.model.get("playing", False)
+        log(f"[runner] toggle -> playing={s.model['playing']}")
         return s.model["playing"]
 
-# ===== CREATOR =====
 class Creator:
     def __init__(s, model, ui_bridge=None):
         s.model = model
@@ -183,15 +192,14 @@ class Creator:
         s.lock = threading.Lock()
         s._register_extensions()
 
-    # ===== EXTENSIONS =====
     def _register_extensions(s):
         T.register_extension("agent", s._ext_agent)
-        T.register_extension("simple", s._ext_simple)
+        T.register_extension("creator", s._ext_creator)
 
     def _ext_agent(s, model, cyc, src, dst, op, eval_flag, bridge):
         parts = dst.split(":")
         if len(parts) < 2: return False
-        cmd = parts[1]
+        cmd = parts[-1]
         agent = s.agents.get(cyc["name"])
         if not agent: return False
         mem = model["memory"].setdefault(cyc["name"], {})
@@ -207,12 +215,13 @@ class Creator:
         elif cmd == "step": mem["::agent:step"] = str(agent.step)
         elif cmd == "focus": mem["::agent:focus"] = agent.focus
         elif cmd == "lineType": mem["::agent:lineType"] = agent.line_type
+        log(f"[ext_agent] {cmd} -> mem={mem.get('::agent:'+cmd)}")
         return True
 
-    def _ext_simple(s, model, cyc, src, dst, op, eval_flag, bridge):
+    def _ext_creator(s, model, cyc, src, dst, op, eval_flag, bridge):
         parts = dst.split(":")
         if len(parts) < 2: return False
-        cmd = parts[1]
+        cmd = parts[-1]
         if cmd == "play" and not model.get("playing"): s.ui.play()
         elif cmd == "pause": s.ui.pause()
         elif cmd == "step": s.ui.step()
@@ -224,9 +233,9 @@ class Creator:
         elif cmd == "close" and src:
             s.ui.save(); s.ui.close(src)
         elif cmd == "exit": s.ui.exit()
+        log(f"[ext_creator] {cmd}")
         return True
 
-    # ===== !TRUE BRIDGE =====
     def _pure_math(s, value, ext_name, ctx):
         mem = {"__v": value if value is not None else ""}
         return eval_expr("__v", mem)
@@ -281,7 +290,6 @@ class Creator:
         }
         return NT.ext_true(model, cyc, src, dst, op, eval_flag, bridge, ctx)
 
-    # ===== LANGUAGE MANAGEMENT =====
     def load_all_fns(s, base_dir):
         return NT.load_all_fns(s.model, base_dir)
 
@@ -304,6 +312,7 @@ class Creator:
         s.model["cycles"].append({"name": name, "lines": lines,
                                   "agent_pos": 0, "color": "#5fb85f", "loop": loop,
                                   "has_agent": has_agent})
+        log(f"[creator] load_cycle {name} has_agent={has_agent}")
         return True
 
     def save_cycle(s, name):
@@ -313,12 +322,12 @@ class Creator:
                 try:
                     with open(path, "w", encoding="utf-8") as f:
                         f.write("\n".join(c["lines"]))
+                    log(f"[creator] save_cycle {name}")
                     return True
                 except Exception:
                     return False
         return False
 
-    # ===== OS FUNCTIONS =====
     def list_files(s, directory):
         try: return sorted(os.listdir(directory))
         except Exception: return []
@@ -334,7 +343,6 @@ class Creator:
             return True
         except Exception: return False
 
-    # ===== AGENT CONTROL =====
     def step_forward(s): return s.runner.step_forward()
     def step_back(s): return s.runner.step_back()
     def reset(s): s.runner.reset()
@@ -352,6 +360,7 @@ class Creator:
             if name not in s.threads:
                 s.threads[name] = ThreadRunner(s, name)
             s.threads[name].start()
+        s.ui.refresh_ui()
 
     def stop_all_threads(s):
         for runner in list(s.threads.values()):
@@ -362,7 +371,6 @@ class Creator:
             runner.join(timeout=1.0)
         s.threads.clear()
 
-    # ===== UI CONVENIENCE =====
     def play(s): s.ui.play()
     def pause(s): s.ui.pause()
     def step(s): s.ui.step()
@@ -374,7 +382,6 @@ class Creator:
     def close(s, name): s.ui.close(name)
     def exit(s): s.ui.exit()
 
-    # ===== HELPERS FOR simple.py =====
     def resolve_line(s, line): return T.resolve_line(line)
     def is_named_node(s, m): return isinstance(m, T.NamedNode)
     def is_condition_node(s, m): return isinstance(m, T.ConditionNode)
@@ -384,9 +391,19 @@ class Creator:
         typ, m = T.resolve_line(line)
         if typ == "version":
             tags.append(("version", 0, len(line)))
-        elif typ == "condition" and m:
-            if isinstance(m, T.ConditionNode):
+        elif typ == "condition":
+            q = line.find("?")
+            if q < 0:
                 tags.append(("cond", 0, len(line)))
+            else:
+                tags.append(("cond", 0, q))
+                act_start = q + 1
+                while act_start < len(line) and line[act_start] == " ":
+                    act_start += 1
+                if act_start < len(line):
+                    tags.append(("act", act_start, len(line)))
+                    for op_m in T.ACTION_OP.finditer(line[act_start:]):
+                        tags.append(("op", act_start + op_m.start(), act_start + op_m.end()))
         elif typ == "action":
             tags.append(("action", 0, len(line)))
             for op_m in T.ACTION_OP.finditer(line):
